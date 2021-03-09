@@ -9,6 +9,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@azure/logger": "^1.0.2",
     "@azure/storage-file-datalake": "^12.3.1"
+  },
+  "devDependencies": {
+    "typescript": "^4.2.3"
   }
 }

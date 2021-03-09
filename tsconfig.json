@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+        "target": "es2019",
+        "module": "commonjs",
+        "outDir": "out",
+        "sourceMap": true,
+        "downlevelIteration": true,
+        "forceConsistentCasingInFileNames": true
+    },
+    "types": [
+        "node"
+    ]
+}
