@@ -8,6 +8,8 @@ import {
     StorageRetryOptions,
     StorageRetryPolicyType,
     Pipeline,
+    ListPathsOptions,
+    DataLakeFileSystemClient,
     StoragePipelineOptions,
     StorageSharedKeyCredential
 } from "@azure/storage-file-datalake"
@@ -36,27 +38,159 @@ async function createFiles(fileSystemClient, seed, num) {
     console.log('\ndone')
 }
 
-async function writePaths(fileSystemClient) {
-
+async function writePathHeader() {
     await fs.promises.writeFile('./paths.csv', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
+}
+
+async function writePathline(path) {
+    const lastidx = path.name.lastIndexOf('/')
+    await fs.promises.appendFile('./paths.csv', `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
+}
+
+async function writePaths(fileSystemClient: DataLakeFileSystemClient) {
+
+    await writePathHeader()
     let iter = await fileSystemClient.listPaths({ path: "/", recursive: true });
 
-    let file = 0
-    let dir = 0
+    let file = 0, dir = 0
     for await (const path of iter) {
         if (path.isDirectory) dir++; else file++;
         process.stdout.cursorTo(0)
         process.stdout.write(`paths... file=${file} dir=${dir} `)
-        const lastidx = path.name.lastIndexOf('/')
-
-        await fs.promises.appendFile('./paths.csv', `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
+        await writePathline(path)
 
     }
     console.log('done')
 }
 
+async function listPaths(fileSystemClient, level, path, release): Promise<{ childdirs: Array<string>, dirs: number, files: number }> {
+    //console.log(`listPaths level=${level} path=${path}`)
+    const childdirs: Array<string> = []
+    const paths = await fileSystemClient.listPaths({ path: path, recursive: false } as ListPathsOptions)
 
-async function getALCs(fileSystemClient, release, fileinfo) {
+    let dirs = 0, files = 0
+
+    for await (const path of paths) {
+        if (path.isDirectory) {
+            dirs++
+            childdirs.push(path.name)
+        } else {
+            files++
+        }
+
+        await writePathline(path)
+
+    }
+    release()
+    return { childdirs, dirs, files }
+}
+
+// RECURSION MEMORY ISSUES At LARGE SCALE !!
+// FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory
+async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
+
+    await writePathHeader()
+
+    let topdirs = 0, topfiles = 0
+
+    const mutex = new Atomic(50)
+
+    async function processesChildren({ childdirs, dirs, files }) {
+        topdirs = topdirs + dirs; topfiles = topfiles + files
+        process.stdout.cursorTo(0)
+        process.stdout.write(`top paths... file=${topfiles} dir=${topdirs} `)
+        //console.log(`processesChildren level=${level} dirs=${childdirs.length}`)
+        for (const path of childdirs) {
+            let release = await mutex.aquire()
+            listPaths(fileSystemClient, level, path, release).then(processesChildren)
+        }
+    }
+
+    await processesChildren({ childdirs: ["/"], dirs: 0, files: 0 })
+    console.log('done')
+
+}
+
+
+var sub = require('subleveldown')
+var level = require('level')
+
+var db = level('./mydb')
+
+const { Writable } = require('stream');
+
+class MyWritable extends Writable {
+    constructor(options) {
+        // Calls the stream.Writable() constructor.
+        super(options);
+        // ...
+    }
+
+    // All Writable stream implementations must provide a writable._write() and/or writable._writev() method to send data to the underlying resource.
+    _write(chunk, encoding, callback) {
+        //if (chunk.toString().indexOf('a') >= 0) {
+        //  callback(new Error('chunk is invalid'));
+        //} else {
+
+        console.log(chunk.toString())
+
+        callback();
+        //}
+    }
+
+}
+
+
+async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient) {
+
+    await writePathHeader()
+
+    let topdirs = 0, topfiles = 0
+
+    const mutex = new Atomic(50)
+
+    const jobqueue = sub(db, 'jobqueue', { valueEncoding: 'json' })
+
+    //const jobstream = jobqueue.createReadStream().on('data',
+    //})
+
+    async function worker(data) {
+        console.log(data.key, '=', data.value)
+        let release = await mutex.aquire()
+        listPaths(fileSystemClient, level, data.key, release).then(async function ({ childdirs, dirs, files }) {
+            topdirs = topdirs + dirs; topfiles = topfiles + files
+            process.stdout.cursorTo(0)
+            process.stdout.write(`top paths... childdirs=${childdirs.length} file=${topfiles} dir=${topdirs} `)
+            //console.log(`processesChildren level=${level} dirs=${childdirs.length}`)
+            console.log([
+                { type: 'del', key: data.key },
+                ...childdirs.map(d => { return { type: 'put', key: d, value: { status: 0 } } })
+            ])
+            await db.batch([
+                { type: 'del', key: data.key },
+                ...childdirs.map(d => { return { type: 'put', key: d, value: { status: 0 } } })
+            ])
+        })
+        /*
+        // new job
+        getJob
+        list files
+     
+        atomic
+        markDone
+        pushJobs
+    */
+
+        jobqueue.put("/", { status: 0 })
+        await new Promise(resolve => setInterval(resolve, 10000))
+        //await new Promise(resolve => jobstream.on('close', resolve))
+    }
+}
+
+
+
+
+async function getALCs(fileSystemClient: DataLakeFileSystemClient, release, fileinfo: string) {
 
     const [isDirectory, path] = fileinfo.split(',')
     //console.log(`getALCs: path=${path}, isDirectory=${isDirectory}`)
@@ -113,7 +247,9 @@ async function main() {
 
 
     if (!filename) {
-        writePaths(fileSystemClient)
+        await writePathsRestartableConcurrent(fileSystemClient)
+        //await writePathsRecurcive(fileSystemClient)
+        //await writePaths(fileSystemClient)
     } else {
 
         const mutex = new Atomic(50)
