@@ -63,9 +63,9 @@ async function writePaths(fileSystemClient: DataLakeFileSystemClient) {
     console.log('done')
 }
 
-async function listPaths(fileSystemClient, level, path, release): Promise<{ childdirs: Array<string>, dirs: number, files: number }> {
+async function mylistPaths(fileSystemClient, path, release): Promise<{ childPaths: Array<string>, dirs: number, files: number }> {
     //console.log(`listPaths level=${level} path=${path}`)
-    const childdirs: Array<string> = []
+    const childPaths: Array<string> = []
     const paths = await fileSystemClient.listPaths({ path: path, recursive: false } as ListPathsOptions)
 
     let dirs = 0, files = 0
@@ -73,7 +73,7 @@ async function listPaths(fileSystemClient, level, path, release): Promise<{ chil
     for await (const path of paths) {
         if (path.isDirectory) {
             dirs++
-            childdirs.push(path.name)
+            childPaths.push(path.name)
         } else {
             files++
         }
@@ -82,7 +82,7 @@ async function listPaths(fileSystemClient, level, path, release): Promise<{ chil
 
     }
     release()
-    return { childdirs, dirs, files }
+    return { childPaths, dirs, files }
 }
 
 // RECURSION MEMORY ISSUES At LARGE SCALE !!
@@ -95,96 +95,100 @@ async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
 
     const mutex = new Atomic(50)
 
-    async function processesChildren({ childdirs, dirs, files }) {
+    async function processesChildren({ childPaths, dirs, files }) {
         topdirs = topdirs + dirs; topfiles = topfiles + files
         process.stdout.cursorTo(0)
         process.stdout.write(`top paths... file=${topfiles} dir=${topdirs} `)
-        //console.log(`processesChildren level=${level} dirs=${childdirs.length}`)
-        for (const path of childdirs) {
+        //console.log(`processesChildren level=${level} dirs=${childPaths.length}`)
+        for (const path of childPaths) {
             let release = await mutex.aquire()
-            listPaths(fileSystemClient, level, path, release).then(processesChildren)
+            mylistPaths(fileSystemClient, path, release).then(processesChildren)
         }
     }
 
-    await processesChildren({ childdirs: ["/"], dirs: 0, files: 0 })
+    await processesChildren({ childPaths: ["/"], dirs: 0, files: 0 })
     console.log('done')
 
 }
 
 
-var sub = require('subleveldown')
-var level = require('level')
+const { Transform } = require('stream');
+class ToCSV extends Transform {
+    private _donehead = false
 
-var db = level('./mydb')
+    _transform(chunk, encoding, cb) {
+        try {
+            if (!this._donehead) {
+                this.push('isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
+                this._donehead = true
+            }
+            const chunkStr = chunk.toString('utf8')
+            //console.log(chunkStr)
+            const chunkObj: JobReturn = JSON.parse(chunkStr)
+            //console.log(chunkObj)
+            if (chunkObj.status === JobStatus.Success) {
 
-const { Writable } = require('stream');
-
-class MyWritable extends Writable {
-    constructor(options) {
-        // Calls the stream.Writable() constructor.
-        super(options);
-        // ...
+                for (let path of chunkObj.payload) {
+                    const lastidx = path.name.lastIndexOf('/')
+                    this.push(`${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
+                }
+            }
+            cb()
+        } catch (e) {
+            cb(new Error(`chunk ${chunk} is not a json: ${e}`));
+        }
     }
-
-    // All Writable stream implementations must provide a writable._write() and/or writable._writev() method to send data to the underlying resource.
-    _write(chunk, encoding, callback) {
-        //if (chunk.toString().indexOf('a') >= 0) {
-        //  callback(new Error('chunk is invalid'));
-        //} else {
-
-        console.log(chunk.toString())
-
-        callback();
-        //}
-    }
-
 }
+
+const level = require('level')
+import { JobManager, JobStatus, JobReturn } from './jobmanager'
 
 
 async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient) {
 
-    await writePathHeader()
-
     let topdirs = 0, topfiles = 0
 
-    const mutex = new Atomic(50)
+    var db = level('./mydb')
+    const q = new JobManager(db, 5, async function (seq: number, path: string): Promise<JobReturn> {
 
-    const jobqueue = sub(db, 'jobqueue', { valueEncoding: 'json' })
+        try {
+            const dirContent: Array<any> = []
+            const childPaths: Array<string> = []
+            const paths = await fileSystemClient.listPaths({ path, recursive: false } as ListPathsOptions)
 
-    //const jobstream = jobqueue.createReadStream().on('data',
-    //})
+            let dirs = 0, files = 0
 
-    async function worker(data) {
-        console.log(data.key, '=', data.value)
-        let release = await mutex.aquire()
-        listPaths(fileSystemClient, level, data.key, release).then(async function ({ childdirs, dirs, files }) {
-            topdirs = topdirs + dirs; topfiles = topfiles + files
-            process.stdout.cursorTo(0)
-            process.stdout.write(`top paths... childdirs=${childdirs.length} file=${topfiles} dir=${topdirs} `)
-            //console.log(`processesChildren level=${level} dirs=${childdirs.length}`)
-            console.log([
-                { type: 'del', key: data.key },
-                ...childdirs.map(d => { return { type: 'put', key: d, value: { status: 0 } } })
-            ])
-            await db.batch([
-                { type: 'del', key: data.key },
-                ...childdirs.map(d => { return { type: 'put', key: d, value: { status: 0 } } })
-            ])
-        })
-        /*
-        // new job
-        getJob
-        list files
-     
-        atomic
-        markDone
-        pushJobs
-    */
+            for await (const path of paths) {
+                dirContent.push(path)
+                if (path.isDirectory) {
+                    dirs++
+                    childPaths.push(path.name)
+                } else {
+                    files++
+                }
+            }
 
-        jobqueue.put("/", { status: 0 })
-        await new Promise(resolve => setInterval(resolve, 10000))
-        //await new Promise(resolve => jobstream.on('close', resolve))
+            return { seq, status: JobStatus.Success, payload: dirContent, newJobs: childPaths }
+        } catch (e) {
+            console.error(e)
+            process.exit(1)
+        }
+
+    })
+
+    const reset = process.argv[2] === '-reset'
+    await q.start(reset)
+    if (reset) {
+        await q.submit("/")
     }
+    await q.finishedSubmitting()
+    console.log('done extracting, creating file...')
+    const s = q.complete.createValueStream().pipe(new ToCSV()).pipe(fs.createWriteStream('./paths.csv'))
+    s.on('finish', () => {
+        console.log('done creating file')
+        db.close(() => console.log('closing job manager'))
+    })
+
 }
 
 
@@ -234,7 +238,7 @@ async function main() {
         }
     */
 
-    const filename = process.argv[2]
+    const filename = 'test'//process.argv[2]
 
     const accountName = process.env.ACCOUNTNAME,
         fileSystemName = process.env.FILESYSTEMNAME,
@@ -246,7 +250,7 @@ async function main() {
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
 
 
-    if (!filename) {
+    if (true) {
         await writePathsRestartableConcurrent(fileSystemClient)
         //await writePathsRecurcive(fileSystemClient)
         //await writePaths(fileSystemClient)
