@@ -63,37 +63,35 @@ async function writePaths(fileSystemClient: DataLakeFileSystemClient) {
     console.log('done')
 }
 
-async function mylistPaths(fileSystemClient, path, release): Promise<{ childPaths: Array<string>, dirs: number, files: number }> {
-    //console.log(`listPaths level=${level} path=${path}`)
-    const childPaths: Array<string> = []
-    const paths = await fileSystemClient.listPaths({ path: path, recursive: false } as ListPathsOptions)
 
-    let dirs = 0, files = 0
-
-    for await (const path of paths) {
-        if (path.isDirectory) {
-            dirs++
-            childPaths.push(path.name)
-        } else {
-            files++
-        }
-
-        await writePathline(path)
-
-    }
-    release()
-    return { childPaths, dirs, files }
-}
 
 // RECURSION MEMORY ISSUES At LARGE SCALE !!
 // FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory
 async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
 
     await writePathHeader()
-
     let topdirs = 0, topfiles = 0
-
     const mutex = new Atomic(50)
+
+    async function mylistPaths(fileSystemClient, path, release): Promise<{ childPaths: Array<string>, dirs: number, files: number }> {
+        //console.log(`listPaths level=${level} path=${path}`)
+        const childPaths: Array<string> = []
+        const paths = await fileSystemClient.listPaths({ path: path, recursive: false } as ListPathsOptions)
+
+        let dirs = 0, files = 0
+
+        for await (const path of paths) {
+            if (path.isDirectory) {
+                dirs++
+                childPaths.push(path.name)
+            } else {
+                files++
+            }
+            await writePathline(path)
+        }
+        release()
+        return { childPaths, dirs, files }
+    }
 
     async function processesChildren({ childPaths, dirs, files }) {
         topdirs = topdirs + dirs; topfiles = topfiles + files
@@ -113,7 +111,7 @@ async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
 
 
 const { Transform } = require('stream');
-class ToCSV extends Transform {
+class PathsCSV extends Transform {
     private _donehead = false
 
     _transform(chunk, encoding, cb) {
@@ -122,17 +120,12 @@ class ToCSV extends Transform {
                 this.push('isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
                 this._donehead = true
             }
-            const chunkStr = chunk.toString('utf8')
-            //console.log(chunkStr)
-            const chunkObj: JobReturn = JSON.parse(chunkStr)
-            //console.log(chunkObj)
-            if (chunkObj.status === JobStatus.Success) {
+            const path = JSON.parse(chunk.toString('utf8'))
+            //console.log(path)
 
-                for (let path of chunkObj.payload) {
-                    const lastidx = path.name.lastIndexOf('/')
-                    this.push(`${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
-                }
-            }
+            const lastidx = path.name.lastIndexOf('/')
+            this.push(`${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
+
             cb()
         } catch (e) {
             cb(new Error(`chunk ${chunk} is not a json: ${e}`));
@@ -140,52 +133,117 @@ class ToCSV extends Transform {
     }
 }
 
+class ACLsCSV extends Transform {
+    private _donehead = false
+
+    _transform(chunk, encoding, cb) {
+        try {
+            if (!this._donehead) {
+                this.push('Filepath,Type,Entity,Read,Write,Execute' + "\n")
+                this._donehead = true
+            }
+            const a = JSON.parse(chunk.toString('utf8'))
+            this.push(`${a.path},${a.accessControlType},${a.entityId},${a.permissions.read},${a.permissions.write},${a.permissions.execute}` + "\n")
+
+            cb()
+        } catch (e) {
+            cb(new Error(`chunk ${chunk} is not a json: ${e}`));
+        }
+    }
+}
+
+
+
 const level = require('level')
+var sub = require('subleveldown')
 import { JobManager, JobStatus, JobReturn } from './jobmanager'
 
 
 async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient) {
 
-    let topdirs = 0, topfiles = 0
-
     var db = level('./mydb')
-    const q = new JobManager(db, 5, async function (seq: number, path: string): Promise<JobReturn> {
+    const reset = process.argv[2] === '-reset'
 
+    const pathsdb = sub(db, 'paths', { valueEncoding: 'json' })
+    const paths_q = new JobManager("paths", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
         try {
-            const dirContent: Array<any> = []
             const childPaths: Array<string> = []
             const paths = await fileSystemClient.listPaths({ path, recursive: false } as ListPathsOptions)
 
             let dirs = 0, files = 0
-
             for await (const path of paths) {
-                dirContent.push(path)
                 if (path.isDirectory) {
                     dirs++
                     childPaths.push(path.name)
                 } else {
                     files++
                 }
+                await pathsdb.put(path.name, JSON.stringify(path))
             }
-
-            return { seq, status: JobStatus.Success, payload: dirContent, newJobs: childPaths }
+            return { seq, status: JobStatus.Success, metrics: { dirs, files }, newJobs: childPaths }
         } catch (e) {
             console.error(e)
             process.exit(1)
         }
-
     })
 
-    const reset = process.argv[2] === '-reset'
-    await q.start(reset)
+    await paths_q.start(reset)
     if (reset) {
-        await q.submit("/")
+        await pathsdb.clear()
+        await paths_q.submit("/")
     }
-    await q.finishedSubmitting()
-    console.log('done extracting, creating file...')
-    const s = q.complete.createValueStream().pipe(new ToCSV()).pipe(fs.createWriteStream('./paths.csv'))
-    s.on('finish', () => {
-        console.log('done creating file')
+    await paths_q.finishedSubmitting()
+
+
+
+    const aclsdb = sub(db, 'acls', { valueEncoding: 'json' })
+    const acls_q = new JobManager("acls", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
+        try {
+            const p = JSON.parse(await pathsdb.get(path))
+
+            let dirs = p.isDirectory ? 1 : 0, files = p.isDirectory ? 0 : 1
+            const permissions = p.isDirectory ? await fileSystemClient.getDirectoryClient(path).getAccessControl() : await fileSystemClient.getFileClient(path).getAccessControl()
+            for (let a of permissions.acl) {
+                await aclsdb.put(`${path}${a.accessControlType}${a.entityId}`, JSON.stringify({ ...a, path }))
+            }
+
+            return { seq, status: JobStatus.Success, metrics: { dirs, files } }
+        } catch (e) {
+            console.error(e)
+            process.exit(1)
+        }
+    })
+
+    await acls_q.start(reset)
+    if (reset) {
+        await aclsdb.clear()
+        await new Promise((res, rej) => {
+            let cnt = 0
+            const feed = pathsdb.createKeyStream().on('data', async d => {
+                cnt++
+                await acls_q.submit(d)
+            })
+            feed.on('end', () => {
+                console.log(`finish queueing ${cnt} acl jobs`)
+                res(cnt)
+            })
+        })
+
+    }
+
+    await acls_q.finishedSubmitting()
+
+
+    console.log('done, creating "paths.csc" file...')
+    const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
+    pfile.on('finish', () => {
+        console.log('done')
+    })
+
+    console.log('creating "acls.csc" file...')
+    const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
+    afile.on('finish', () => {
+        console.log('done')
         db.close(() => console.log('closing job manager'))
     })
 

@@ -52,9 +52,9 @@ class MissingSequence extends Transform {
 
 export interface JobReturn {
     status: JobStatus;
+    metrics: any;
     seq: number;
-    payload: any;
-    newJobs: Array<any>;
+    newJobs?: Array<any>;
 }
 
 export enum JobStatus {
@@ -64,6 +64,7 @@ export enum JobStatus {
 
 export class JobManager {
 
+    private _name
     private _db
     private _queue
     private _complete
@@ -75,7 +76,8 @@ export class JobManager {
     private _nomore
 
 
-    constructor(db, concurrency: number, workerfn: (seq: number, d: string) => Promise<JobReturn>) {
+    constructor(name: string, db, concurrency: number, workerfn: (seq: number, d: string) => Promise<JobReturn>) {
+        this._name = name
         this._db = db
         this._limit = concurrency
         this._workerFn = workerfn
@@ -101,24 +103,28 @@ export class JobManager {
         let release = await this._mutex.aquire()
 
         this._nomore = false
-        this._complete = sub(this._db, 'complete', { valueEncoding: 'utf8' })
-        this._queue = sub(this._db, 'queue', { valueEncoding: 'json' })
-        this._control = sub(this._db, 'control', { valueEncoding: 'json' })
+        this._complete = sub(this._db, `${this._name}_complete`, { valueEncoding: 'json' })
+        this._queue = sub(this._db, `${this._name}_queue`, { valueEncoding: 'json' })
+        this._control = sub(this._db, `${this._name}_control`, { valueEncoding: 'json' })
 
         if (reset) {
-            console.log(`JobManager: Start RESET`)
+            console.log(`JobManager (${this._name}): Starting concurrency=${this._limit} (with reset)`)
             await this.complete.clear()
             await this._queue.clear()
 
             await this._control.put(0, {
                 nextSequence: 0,
                 nextToRun: 0,
-                numberCompleted: 0
+                numberCompleted: 0,
+                metrics: {
+                    dirs: 0,
+                    files: 0
+                }
             })
         } else {
             const { nextSequence, nextToRun, numberCompleted } = await this._control.get(0)
             const running = await this._getRunning(nextToRun)
-            console.log(`JobManager: Start nextToRun=${nextToRun}, numberCompleted=${numberCompleted}. Restarting running processes ${running.join(',')}...`)
+            console.log(`JobManager (${this._name}): continuing from :  nextToRun=${nextToRun}, numberCompleted=${numberCompleted}. Restarting running processes ${running.join(',')}...`)
 
 
             for (let runningseq of running) {
@@ -130,10 +136,11 @@ export class JobManager {
 
         this._finishedPromise = new Promise(resolve => {
             const interval = setInterval(async () => {
-                const { nextSequence, nextToRun, numberCompleted } = await this._control.get(0)
-                console.log(`PersistantJobQueue nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted}`)
+                const { nextSequence, nextToRun, numberCompleted, metrics } = await this._control.get(0)
+                process.stdout.cursorTo(0)
+                process.stdout.write(`(${this._name}) metrics.files=${metrics.files} metrics.dirs=${metrics.dirs} (nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted})`)
                 if (nextSequence === numberCompleted && this._nomore) {
-                    console.log(`JobManager: closing`)
+                    console.log(`\nJobManager (${this._name}): closing`)
                     clearInterval(interval)
                     resolve(true)
                 }
@@ -162,14 +169,15 @@ export class JobManager {
     private async checkRun(newWorkData?, completed?: JobReturn) {
         //console.log(`checkRun - aquire newWorkData=${newWorkData} completed=${JSON.stringify(completed)}`)
         let release = await this._mutex.aquire()
-        let { nextSequence, nextToRun, numberCompleted } = await this._control.get(0)
+        let { nextSequence, nextToRun, numberCompleted, metrics } = await this._control.get(0)
 
         let newWorkNext = newWorkData && nextToRun === nextSequence
 
         if (completed) {
             //console.log(`completed job : ${JSON.stringify(completed)}`)
-            await this._complete.put(JobManager.inttoKey(completed.seq), JSON.stringify({ status: completed.status, payload: completed.payload }))
+            await this._complete.put(JobManager.inttoKey(completed.seq), { status: completed.status })
             numberCompleted++
+            metrics.dirs = metrics.dirs + completed.metrics.dirs; metrics.files = metrics.files + completed.metrics.files
             if (completed.newJobs && completed.newJobs.length > 0) {
                 await this._queue.batch(completed.newJobs.map(f => { return { type: 'put', key: nextSequence++, value: f } }))
             }
@@ -184,7 +192,7 @@ export class JobManager {
             nextToRun++
         }
 
-        await this._control.put(0, { nextSequence, nextToRun, numberCompleted })
+        await this._control.put(0, { nextSequence, nextToRun, numberCompleted, metrics })
         //console.log(`checkRun - end: nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted}`)
         release()
 
