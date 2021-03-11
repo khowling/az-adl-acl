@@ -280,17 +280,32 @@ export class JobManager {
         await this.checkRun(data)
     }
 
-    async submitHolding(jobSequence: number, batchIdx: number, data: JobData[]) {
+    async submitHolding(jobSequence: number, batchIdx: number, data: JobData[]): Promise<boolean> {
 
         if (data && data.length > 0) {
             let release = await this._mutex.aquire()
 
             let ctl = await this._control.get(0)
             ctl.holdingBatches = ctl.holdingBatches + 1
-            await this._holdingqueue.put(JobManager.inttoKey(jobSequence) + '-' + batchIdx, holdingJobData.toBuffer(data))
-            await this._control.put(0, ctl)
+            const batchkey = JobManager.inttoKey(jobSequence) + '-' + batchIdx
 
+            const alreadyExistis: boolean = await new Promise((res, rej) => {
+                this._holdingqueue.get(batchkey, (err, value) => {
+                    if (err) {
+                        if (err.notFound) {
+                            res(false)
+                        }
+                    }
+                    res(true)
+                })
+            })
+            if (!alreadyExistis) {
+                await this._holdingqueue.put(batchkey, holdingJobData.toBuffer(data))
+                await this._control.put(0, ctl)
+            }
             release()
+            // return true if holding inserted OK, return false, if already a holding job for this job (for a unclear restart to ensure the job knows its alrady been done!)
+            return alreadyExistis
         }
     }
 }

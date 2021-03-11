@@ -259,12 +259,17 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
                             }
                             //await pathsdb.put(path.name, pathType.toBuffer(path))                        
                         }
-                        await paths_q.submitHolding(seq, holdingBatches++, holdingJobData)
 
-                        await fs.promises.appendFile('./paths.csv', response.pathItems.map(path => {
-                            const lastidx = path.name.lastIndexOf('/')
-                            return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
-                        }).join("\n") + "\n")
+                        if (holdingJobData.length > 0) {
+                            const alreadyExistis = await paths_q.submitHolding(seq, holdingBatches++, holdingJobData)
+                            // if already exists, may be from a restart, and the full job didnt move from the holding queue, so dont re-write the file!
+                            if (!alreadyExistis) {
+                                await fs.promises.appendFile('./paths.csv', response.pathItems.map(path => {
+                                    const lastidx = path.name.lastIndexOf('/')
+                                    return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
+                                }).join("\n") + "\n")
+                            }
+                        }
 
                     }
                 }
