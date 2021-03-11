@@ -137,10 +137,14 @@ export class JobManager {
         this._finishedPromise = new Promise(resolve => {
             const interval = setInterval(async () => {
                 const { nextSequence, nextToRun, numberCompleted, metrics } = await this._control.get(0)
-                process.stdout.cursorTo(0)
-                process.stdout.write(`(${this._name}) metrics.files=${metrics.files} metrics.dirs=${metrics.dirs} (nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted})`)
+                const log = `(${this._name}) metrics.files=${metrics.files} metrics.dirs=${metrics.dirs} (nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted})`
+                if (!process.env.BACKGROUND) {
+                    process.stdout.cursorTo(0); process.stdout.write(log)
+                } else {
+                    console.log(log)
+                }
                 if (nextSequence === numberCompleted && this._nomore) {
-                    console.log(`\nJobManager (${this._name}): closing`)
+                    console.log()
                     clearInterval(interval)
                     resolve(true)
                 }

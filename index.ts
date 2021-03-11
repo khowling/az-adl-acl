@@ -16,7 +16,7 @@ import {
 
 import { setLogLevel } from '@azure/logger'
 
-
+/*
 async function createFiles(fileSystemClient, seed, num) {
     let i = 0
     for (let topdir of [...Array(num).keys()].map(n => `${seed}dirtop${n}`)) {
@@ -110,6 +110,29 @@ async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
 }
 
 
+
+async function getALCs(fileSystemClient: DataLakeFileSystemClient, release, fileinfo: string) {
+
+    const [isDirectory, path] = fileinfo.split(',')
+    //console.log(`getALCs: path=${path}, isDirectory=${isDirectory}`)
+    if (isDirectory === 'true') {
+        const dpermissions = await fileSystemClient.getDirectoryClient(path).getAccessControl();
+        dpermissions.acl.forEach(async p => {
+            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
+        })
+    } else {
+        const fpermissions = await fileSystemClient.getFileClient(path).getAccessControl();
+        fpermissions.acl.forEach(async p => {
+            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
+        })
+
+    }
+    release()
+
+}
+
+*/
+
 const { Transform } = require('stream');
 class PathsCSV extends Transform {
     private _donehead = false
@@ -120,8 +143,7 @@ class PathsCSV extends Transform {
                 this.push('isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
                 this._donehead = true
             }
-            const path = JSON.parse(chunk.toString('utf8'))
-            //console.log(path)
+            const path = pathType.fromBuffer(chunk)
 
             const lastidx = path.name.lastIndexOf('/')
             this.push(`${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
@@ -142,8 +164,10 @@ class ACLsCSV extends Transform {
                 this.push('Filepath,Type,Entity,Read,Write,Execute' + "\n")
                 this._donehead = true
             }
-            const a = JSON.parse(chunk.toString('utf8'))
-            this.push(`${a.path},${a.accessControlType},${a.entityId},${a.permissions.read},${a.permissions.write},${a.permissions.execute}` + "\n")
+            const { path, acls } = aclType2.fromBuffer(chunk)
+            for (let a of acls) {
+                this.push(`${path},${a.accessControlType},${a.entityId},${a.permissions.read},${a.permissions.write},${a.permissions.execute}` + "\n")
+            }
 
             cb()
         } catch (e) {
@@ -153,18 +177,72 @@ class ACLsCSV extends Transform {
 }
 
 
-
+const avro = require('avsc');
 const level = require('level')
 var sub = require('subleveldown')
 import { JobManager, JobStatus, JobReturn } from './jobmanager'
 
+const pathType = avro.Type.forValue({
+    name: "dir1",
+    isDirectory: true,
+    lastModified: new Date(),
+    owner: "$superuser",
+    group: "$superuser",
+    permissions: {
+        owner: {
+            read: true,
+            write: true,
+            execute: true
+        },
+        group: {
+            read: true,
+            write: false,
+            execute: true
+        },
+        other: {
+            read: false,
+            write: false,
+            execute: false
+        },
+        stickyBit: false,
+        extendedAcls: false
+    },
+    creationTime: "132596885753691420",
+    etag: "0x8D8E2416422FEF2"
+})
 
-async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient) {
+const aclType2 = avro.Type.forValue({
+    path: "dir1",
+    acls: [
+        {
+            "defaultScope": false,
+            "accessControlType": "user",
+            "entityId": "",
+            "permissions": {
+                "read": true,
+                "write": true,
+                "execute": false
+            }
+        },
+        {
+            "defaultScope": false,
+            "accessControlType": "user",
+            "entityId": "",
+            "permissions": {
+                "read": true,
+                "write": true,
+                "execute": false
+            }
+        }
+    ]
+})
+
+
+async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, startDir: string, reset: boolean) {
 
     var db = level('./mydb')
-    const reset = process.argv[2] === '-reset'
 
-    const pathsdb = sub(db, 'paths', { valueEncoding: 'json' })
+    const pathsdb = sub(db, 'paths', { valueEncoding: 'binary' })
     const paths_q = new JobManager("paths", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
         try {
             const childPaths: Array<string> = []
@@ -178,7 +256,8 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
                 } else {
                     files++
                 }
-                await pathsdb.put(path.name, JSON.stringify(path))
+                const val = pathType.toBuffer(path)
+                await pathsdb.put(path.name, val)
             }
             return { seq, status: JobStatus.Success, metrics: { dirs, files }, newJobs: childPaths }
         } catch (e) {
@@ -189,23 +268,26 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
 
     await paths_q.start(reset)
     if (reset) {
+
         await pathsdb.clear()
-        await paths_q.submit("/")
+        console.log(`Seeding path startDir=${startDir}`)
+        await paths_q.submit(startDir)
     }
     await paths_q.finishedSubmitting()
 
 
 
-    const aclsdb = sub(db, 'acls', { valueEncoding: 'json' })
+    const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
     const acls_q = new JobManager("acls", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
         try {
-            const p = JSON.parse(await pathsdb.get(path))
+            const val = await pathsdb.get(path)
+            const p = pathType.fromBuffer(val)
 
             let dirs = p.isDirectory ? 1 : 0, files = p.isDirectory ? 0 : 1
             const permissions = p.isDirectory ? await fileSystemClient.getDirectoryClient(path).getAccessControl() : await fileSystemClient.getFileClient(path).getAccessControl()
-            for (let a of permissions.acl) {
-                await aclsdb.put(`${path}${a.accessControlType}${a.entityId}`, JSON.stringify({ ...a, path }))
-            }
+            //for (let a of permissions.acl) {
+            await aclsdb.put(path, aclType2.toBuffer({ path, acls: permissions.acl }))
+            //}
 
             return { seq, status: JobStatus.Success, metrics: { dirs, files } }
         } catch (e) {
@@ -233,113 +315,110 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
 
     await acls_q.finishedSubmitting()
 
-
-    console.log('done, creating "paths.csc" file...')
-    const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
-    pfile.on('finish', () => {
-        console.log('done')
+    await new Promise((res, rej) => {
+        console.log('Creating "paths.csv" file...')
+        const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
+        pfile.on('finish', () => {
+            console.log('finished  "paths.csv"')
+            res(true)
+        })
     })
 
-    console.log('creating "acls.csc" file...')
-    const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
-    afile.on('finish', () => {
-        console.log('done')
-        db.close(() => console.log('closing job manager'))
+    await new Promise((res, rej) => {
+        console.log('Creating "acls.csv" file...')
+        const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
+        afile.on('finish', () => {
+            console.log('finished "acls.csv"')
+            res(true)
+        })
     })
 
+    db.close(() => console.log('closing job manager'))
 }
 
+function args() {
 
-
-
-async function getALCs(fileSystemClient: DataLakeFileSystemClient, release, fileinfo: string) {
-
-    const [isDirectory, path] = fileinfo.split(',')
-    //console.log(`getALCs: path=${path}, isDirectory=${isDirectory}`)
-    if (isDirectory === 'true') {
-        const dpermissions = await fileSystemClient.getDirectoryClient(path).getAccessControl();
-        dpermissions.acl.forEach(async p => {
-            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
-        })
-    } else {
-        const fpermissions = await fileSystemClient.getFileClient(path).getAccessControl();
-        fpermissions.acl.forEach(async p => {
-            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
-        })
-
+    function usage(e?) {
+        if (e) console.log(e)
+        console.log('usage:')
+        console.log(`    ${process.argv[0]} ${process.argv[1]} -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [-dir <starting directory] [-R]`)
+        console.log(`         -R   :  Reset, clear the current run progress & start from begining`)
+        console.log(`         -dir :  Starting point for ACL extraction (default "/")`)
+        process.exit(1)
     }
-    release()
 
+    let argIdx = 2
+    let nextparam
+    let opts = []
+    opts['reset'] = false
+    opts['dir'] = "/"
+    while (argIdx < process.argv.length) {
+        switch (process.argv[argIdx]) {
+            case '-a':
+                nextparam = 'accountName'
+                break
+            case '-f':
+                nextparam = 'filesystemName'
+                break
+            case '-sas':
+                nextparam = 'sas'
+                break
+            case '-key':
+                nextparam = 'key'
+                break
+            case '-dir':
+                nextparam = 'dir'
+                break
+            case '-R':
+                opts['reset'] = true
+                break
+            default:
+                if (/^-/.test(process.argv[argIdx])) {
+                    usage(`unknown argument ${process.argv[argIdx]}`)
+                } else if (nextparam) {
+                    opts[nextparam] = process.argv[argIdx]
+                } else {
+                    usage(`unknown argument ${process.argv[argIdx]}`)
+                }
+                nextparam = null
+        }
+        argIdx++
+    }
+    if (!(opts['accountName'] && opts['filesystemName'] && (opts['sas'] || opts['key']))) {
+        usage()
+    }
+    return opts
 }
-async function main() {
 
-    const split = process.env.SPLIT || 2
+
+async function main() {
+    const opts = args()
     let opt: StoragePipelineOptions
     /*
         // https://github.com/Azure/azure-sdk-for-js/blob/52d621342a9094d7af0b38eed9476af1a451070d/sdk/storage/storage-file-datalake/src/Pipeline.ts#L157
         // https://azuresdkdocs.blob.core.windows.net/$web/javascript/azure-storage-file-datalake/12.3.1/interfaces/storagepipelineoptions.html
-    
         setLogLevel('warning');
         opt = {
             userAgentOptions: {},
-            keepAliveOptions: {
-                enable: true
-            },
+            keepAliveOptions: { enable: true },
             retryOptions: {
                 retryPolicyType: StorageRetryPolicyType.FIXED,
                 maxTries: 1
             },
             // https://github.com/Azure/azure-sdk-for-js/blob/52d621342a9094d7af0b38eed9476af1a451070d/sdk/core/core-http/src/nodeFetchHttpClient.ts
-            httpClient: {
-    
-            }
+            httpClient: { }
         }
     */
 
-    const filename = 'test'//process.argv[2]
-
-    const accountName = process.env.ACCOUNTNAME,
-        fileSystemName = process.env.FILESYSTEMNAME,
-        adlurl = `https://${accountName}.dfs.core.windows.net` + (process.env.SASKEY ? `?${process.env.SASKEY}` : ''),
-        serviceClient = new DataLakeServiceClient(adlurl, process.env.ADLKEY ? new StorageSharedKeyCredential(accountName, process.env.ADLKEY) : undefined, opt)
+    const accountName = opts['accountName'],
+        fileSystemName = opts['filesystemName'],
+        adlurl = `https://${accountName}.dfs.core.windows.net` + (opts['sas'] ? `?${opts['sas']}` : ''),
+        serviceClient = new DataLakeServiceClient(adlurl, opts['key'] ? new StorageSharedKeyCredential(accountName, opts['key']) : undefined, opt)
 
     //console.log("sas token" + serviceClient.generateAccountSasUrl(new Date(Date.now() + (3600 * 1000 * 24)), AccountSASPermissions.parse('rwlacup'), "s"))
 
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
-
-
-    if (true) {
-        await writePathsRestartableConcurrent(fileSystemClient)
-        //await writePathsRecurcive(fileSystemClient)
-        //await writePaths(fileSystemClient)
-    } else {
-
-        const mutex = new Atomic(50)
-        const fileStream = fs.createReadStream(filename)
-
-        await fs.promises.writeFile('./acls.csv', 'Filepath,Type,Entity,Read,Write,Execute' + "\n")
-        const rl = require('readline').createInterface({
-            input: fileStream,
-            crlfDelay: Infinity
-        });
-        // Note: we use the crlfDelay option to recognize all instances of CR LF
-        // ('\r\n') in input.txt as a single line break.
-        let line = 0
-        for await (const fileline of rl) {
-            // Each line in input.txt will be successively available here as `line`.
-            line++
-            process.stdout.cursorTo(0)
-            process.stdout.write(`acls... ${line}`)
-
-            if (line === 1) continue; // header
-
-            let release = await mutex.aquire()
-            getALCs(fileSystemClient, release, fileline)
-
-        }
-        console.log('done')
-    }
-
+    await writePathsRestartableConcurrent(fileSystemClient, opts['dir'], opts['reset'])
 }
 
 main()
