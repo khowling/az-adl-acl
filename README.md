@@ -1,15 +1,21 @@
 ## Extract ADL ACLs
 
-Command line tool traverses Azure Datalake filesystem to export all file and directory acls from the specified directory
+Command line tool traverses the Azure Datalake filesystem to export all file and directory acls from within the specified directory
 
-This tool maintains its state, that enables it to be re-startable.  On the FIRST run, be sure to use the '-R' reset, option, then if the tool stops part way through, you can restart it just by missing off the -R. (Reset will clear down the state and output files and start again)
+This tool maintains its state, this enables it to be re-startable.  On the FIRST run, be sure to use the '-R' reset, option, then if the tool stops part way through, you can restart it just by missing off the -R. (Reset will clear down the state and output files and start again)
 
 
 NOTE: For very large Datalakes (>10million objects), use the '-dir' option to limit the data produced, and you can start multiple instances of the tool for scale, but NOT in the same folder.
 
+If running the tool on a Azure VM, its recommended to ensure the VM is in the same region as the DataLake, and you select a machine with fast IO (ephemeral VM is ideal), for example : Standard D4s v3 
+
+## Prepreqs
+
+ * nodejs V14 (TLS)
 
 ## Usage
 
+NOTE: ensure you install dependencies before running: ```$ npm i```
 
 npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [-dir <starting directory] [-R]
 
