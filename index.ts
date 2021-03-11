@@ -38,15 +38,6 @@ async function createFiles(fileSystemClient, seed, num) {
     console.log('\ndone')
 }
 
-async function writePathHeader() {
-    await fs.promises.writeFile('./paths.csv', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
-}
-
-async function writePathline(path) {
-    const lastidx = path.name.lastIndexOf('/')
-    await fs.promises.appendFile('./paths.csv', `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
-}
-
 async function writePaths(fileSystemClient: DataLakeFileSystemClient) {
 
     await writePathHeader()
@@ -180,7 +171,7 @@ class ACLsCSV extends Transform {
 const avro = require('avsc');
 const level = require('level')
 var sub = require('subleveldown')
-import { JobManager, JobStatus, JobReturn } from './jobmanager'
+import { JobManager, JobStatus, JobReturn, JobData, JobTask } from './jobmanager'
 
 const pathType = avro.Type.forValue({
     name: "dir1",
@@ -237,29 +228,61 @@ const aclType2 = avro.Type.forValue({
     ]
 })
 
-
 async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, startDir: string, reset: boolean) {
 
     var db = level('./mydb')
 
-    const pathsdb = sub(db, 'paths', { valueEncoding: 'binary' })
-    const paths_q = new JobManager("paths", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
-        try {
-            const childPaths: Array<string> = []
-            const paths = await fileSystemClient.listPaths({ path, recursive: false } as ListPathsOptions)
+    //const pathsdb = sub(db, 'paths', { valueEncoding: 'binary' })
+    //const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
+    if (reset) {
+        await fs.promises.writeFile('./paths.csv', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
+        await fs.promises.writeFile('./acls.csv', 'Filepath,Type,Entity,Read,Write,Execute' + "\n")
+    }
 
-            let dirs = 0, files = 0
-            for await (const path of paths) {
-                if (path.isDirectory) {
-                    dirs++
-                    childPaths.push(path.name)
-                } else {
-                    files++
+    const paths_q = new JobManager("paths", db, 50, async function (seq: number, d: JobData): Promise<JobReturn> {
+
+        try {
+            let dirs = 0, files = 0, acls = 0, holdingBatches = 0
+
+            if (d.task === JobTask.ListPaths) {
+                for await (const response of fileSystemClient.listPaths({ path: d.path, recursive: false }).byPage({ maxPageSize: 10000 })) {
+                    if (response.pathItems) {
+                        let holdingJobData: Array<JobData> = []
+                        for (const path of response.pathItems) {
+
+                            holdingJobData.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory })
+                            if (path.isDirectory) {
+                                dirs++
+                                holdingJobData.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory })
+                            } else {
+                                files++
+                            }
+                            //await pathsdb.put(path.name, pathType.toBuffer(path))                        
+                        }
+                        await paths_q.submitHolding(seq, holdingBatches++, holdingJobData)
+
+                        await fs.promises.appendFile('./paths.csv', response.pathItems.map(path => {
+                            const lastidx = path.name.lastIndexOf('/')
+                            return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
+                        }).join("\n") + "\n")
+
+                    }
                 }
-                const val = pathType.toBuffer(path)
-                await pathsdb.put(path.name, val)
+
+            } else if (d.task === JobTask.GetACLs) {
+
+                const permissions = d.isDirectory ? await fileSystemClient.getDirectoryClient(d.path).getAccessControl() : await fileSystemClient.getFileClient(d.path).getAccessControl()
+                //await aclsdb.put(d.path, aclType2.toBuffer({ path: d.path, acls: permissions.acl }))
+                for (const p of permissions.acl) {
+                    acls++
+                    await fs.promises.appendFile('./acls.csv', `${d.path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
+                }
+
+            } else {
+                throw new Error(`Unknown JobTask ${d.task}`)
             }
-            return { seq, status: JobStatus.Success, metrics: { dirs, files }, newJobs: childPaths }
+
+            return { seq, status: JobStatus.Success, metrics: { acls, dirs, files }, holdingBatches }
         } catch (e) {
             console.error(e)
             process.exit(1)
@@ -269,70 +292,70 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
     await paths_q.start(reset)
     if (reset) {
 
-        await pathsdb.clear()
+        //await pathsdb.clear()
         console.log(`Seeding path startDir=${startDir}`)
-        await paths_q.submit(startDir)
+        await paths_q.submit({ task: JobTask.ListPaths, path: startDir, isDirectory: true })
     }
     await paths_q.finishedSubmitting()
 
 
-
-    const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
-    const acls_q = new JobManager("acls", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
-        try {
-            const val = await pathsdb.get(path)
-            const p = pathType.fromBuffer(val)
-
-            let dirs = p.isDirectory ? 1 : 0, files = p.isDirectory ? 0 : 1
-            const permissions = p.isDirectory ? await fileSystemClient.getDirectoryClient(path).getAccessControl() : await fileSystemClient.getFileClient(path).getAccessControl()
-            //for (let a of permissions.acl) {
-            await aclsdb.put(path, aclType2.toBuffer({ path, acls: permissions.acl }))
-            //}
-
-            return { seq, status: JobStatus.Success, metrics: { dirs, files } }
-        } catch (e) {
-            console.error(e)
-            process.exit(1)
+    /*
+        const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
+        const acls_q = new JobManager("acls", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
+            try {
+                const val = await pathsdb.get(path)
+                const p = pathType.fromBuffer(val)
+    
+                let dirs = p.isDirectory ? 1 : 0, files = p.isDirectory ? 0 : 1
+                const permissions = p.isDirectory ? await fileSystemClient.getDirectoryClient(path).getAccessControl() : await fileSystemClient.getFileClient(path).getAccessControl()
+                //for (let a of permissions.acl) {
+                await aclsdb.put(path, aclType2.toBuffer({ path, acls: permissions.acl }))
+                //}
+    
+                return { seq, status: JobStatus.Success, metrics: { dirs, files } }
+            } catch (e) {
+                console.error(e)
+                process.exit(1)
+            }
+        })
+    
+        await acls_q.start(reset)
+        if (reset) {
+            await aclsdb.clear()
+            await new Promise((res, rej) => {
+                let cnt = 0
+                const feed = pathsdb.createKeyStream().on('data', async d => {
+                    cnt++
+                    await acls_q.submit(d)
+                })
+                feed.on('end', () => {
+                    console.log(`finish queueing ${cnt} acl jobs`)
+                    res(cnt)
+                })
+            })
+    
         }
-    })
-
-    await acls_q.start(reset)
-    if (reset) {
-        await aclsdb.clear()
+    
+        await acls_q.finishedSubmitting()
+    
         await new Promise((res, rej) => {
-            let cnt = 0
-            const feed = pathsdb.createKeyStream().on('data', async d => {
-                cnt++
-                await acls_q.submit(d)
-            })
-            feed.on('end', () => {
-                console.log(`finish queueing ${cnt} acl jobs`)
-                res(cnt)
+            console.log('Creating "paths.csv" file...')
+            const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
+            pfile.on('finish', () => {
+                console.log('finished  "paths.csv"')
+                res(true)
             })
         })
-
-    }
-
-    await acls_q.finishedSubmitting()
-
-    await new Promise((res, rej) => {
-        console.log('Creating "paths.csv" file...')
-        const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
-        pfile.on('finish', () => {
-            console.log('finished  "paths.csv"')
-            res(true)
+    
+        await new Promise((res, rej) => {
+            console.log('Creating "acls.csv" file...')
+            const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
+            afile.on('finish', () => {
+                console.log('finished "acls.csv"')
+                res(true)
+            })
         })
-    })
-
-    await new Promise((res, rej) => {
-        console.log('Creating "acls.csv" file...')
-        const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
-        afile.on('finish', () => {
-            console.log('finished "acls.csv"')
-            res(true)
-        })
-    })
-
+    */
     db.close(() => console.log('closing job manager'))
 }
 
