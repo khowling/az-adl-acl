@@ -196,7 +196,7 @@ export class JobManager {
         }
 
         if (!continueRun) {
-            console.log(`JobManager: Starting concurrency=${this._limit} (with reset)`)
+            console.log(`JobManager: Starting new run (concurrency=${this._limit})`)
             await this._queue.clear()
             await this._running.clear()
             await this._control.put(0, controlInit)
@@ -225,7 +225,7 @@ export class JobManager {
                 })
             })
 
-            console.log(`JobManager: Starting: queued=${nextSequence} running=${numberRunning} completed=${numberCompleted}`)
+            console.log(`JobManager: Re-starting: queued=${nextSequence} running=${numberRunning} completed=${numberCompleted}`)
 
             if (rkeys.length > 0) {
                 console.log(`JobManager: Restarting : ${rkeys.join(',')}...`)

@@ -228,7 +228,7 @@ const aclType2 = avro.Type.forValue({
     ]
 })
 
-async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, startDir: string, continueRun: boolean) {
+async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean) {
 
     var db = level('./mydb')
 
@@ -240,7 +240,7 @@ async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSys
         await fs.promises.writeFile('./errors.csv', 'TaskSequence,TaskType,Path,Error' + "\n")
     }
 
-    const paths_q = new JobManager(db, 50, async function (seq: number, d: JobData, r: JobRunningData): Promise<JobReturn> {
+    const paths_q = new JobManager(db, concurrency, async function (seq: number, d: JobData, r: JobRunningData): Promise<JobReturn> {
         let currentBatch = 0
         try {
             if (d.task === JobTask.ListPaths) {
@@ -382,12 +382,16 @@ function args() {
     let argIdx = 2
     let nextparam
     let opts = []
+    opts['concurrency'] = 256
     opts['continue'] = false
     opts['dir'] = "/"
     while (argIdx < process.argv.length) {
         switch (process.argv[argIdx]) {
             case '-a':
                 nextparam = 'accountName'
+                break
+            case '-c':
+                nextparam = 'concurrency'
                 break
             case '-f':
                 nextparam = 'filesystemName'
@@ -450,7 +454,7 @@ async function main() {
     //console.log("sas token" + serviceClient.generateAccountSasUrl(new Date(Date.now() + (3600 * 1000 * 24)), AccountSASPermissions.parse('rwlacup'), "s"))
 
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
-    await writePathsRestartableConcurrent(fileSystemClient, opts['dir'], opts['continue'])
+    await writePathsRestartableConcurrent(fileSystemClient, opts['concurrency'], opts['dir'], opts['continue'])
 }
 
 main()
