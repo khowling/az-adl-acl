@@ -5,17 +5,19 @@ Command line tool traverses the Azure Datalake filesystem to export all file and
 This tool maintains its state, this enables it to be re-startable.  If the tool was interrupted or terminated before finishing, to continue a run, be sure to use the '-continue' option, then if the tool stops part way through, it will restart where it left off. If this is not provided, the new invocation will clear down the state and output files and start again.
 
 
-NOTE: For very large Datalakes (>10million objects), use the '-dir' option to limit the data produced, and you can start multiple instances of the tool for scale, but NOT in the same folder.
-
-If running the tool on a Azure VM, its recommended to ensure the VM is in the same region as the DataLake, and you select a machine with fast local IO (ephemeral VM is ideal), for example : `Standard D4s v3`
+NOTE: Recomendations for large Datalakes (>10million objects):
+ * Use the '-dir' option to limit the data produced, and you can start multiple instances of the tool for scale, but NOT in the same folder.
+ * If running the tool on a Azure VM, its recommended to ensure the VM is in the same region as the DataLake, and you select a machine with fast local IO (ephemeral VM is ideal), for example : `Standard D4s v3`
+ * If writing to Blob, use Premium Storage Account in the same region
+ * Use `nohup` as example it the usage section
 
 ## Prepreqs
 
- * nodejs V14 (TLS)
+ * Nodejs V14 (LTS) or above
 
 ## Usage
 
-NOTE: ensure you install dependencies before running: ```$ npm i```
+NOTE: ensure you install dependencies using `$ npm i` before running: 
 
 ```
 npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [ -storestr <connection str>  -storecontainer <blob container> ] [-dir <starting directory] [-continue]

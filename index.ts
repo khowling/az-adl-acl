@@ -240,11 +240,11 @@ class WriteAppendBlobs {
     private blobs
     private containerClient
     private cachedClients = {}
-    private _mutex
+    private _mutexs = {}
 
 
     constructor(db, connectionStr: string, container: string) {
-        this._mutex = new Atomic(1)
+
         this.blobs = sub(db, 'blobs', { valueEncoding: 'json' })
         const blobServiceClient = BlobServiceClient.fromConnectionString(connectionStr);
         this.containerClient = blobServiceClient.getContainerClient(container)
@@ -269,17 +269,21 @@ class WriteAppendBlobs {
         return this.cachedClients[blob]
     }
 
-    async init(files: string[], continueRun: boolean) {
+    async init(blobs: string[], continueRun: boolean) {
+        for (const b of blobs) {
+            this._mutexs[b] = new Atomic(1)
+        }
+
         if (!continueRun) {
             const d = new Date()
-            for (const f of files) {
-                await this.blobs.put(f, { seq: 0, block: 0, size: 0, path: `${d.toISOString()}/${f}` })
+            for (const b of blobs) {
+                await this.blobs.put(b, { seq: 0, block: 0, size: 0, path: `${d.toISOString()}/${b}` })
             }
         }
     }
 
     async write(blob: string, body: string) {
-        let release = await this._mutex.aquire()
+        let release = await this._mutexs[blob].aquire()
         const c = await this.getClient(blob, body.length)
         await c.appendBlock(body, body.length)
         release()
