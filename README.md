@@ -18,24 +18,27 @@ If running the tool on a Azure VM, its recommended to ensure the VM is in the sa
 NOTE: ensure you install dependencies before running: ```$ npm i```
 
 ```
-npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [-dir <starting directory] [-continue]
+npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [ -storestr <connection str>  -storecontainer <blob container> ] [-dir <starting directory] [-continue]
 
-    -continue   :  Continue last run from where it left off
-    -dir        :  Starting point for ACL extraction (default "/")
+    -storestr & -storecontainer   :  Azure Blob Storage Account connection string and container (if not provided, output to local dir)
+    -continue                     :  Continue last run from where it left off
+    -dir                          :  Starting point for ACL extraction (default "/")
 ```
 
 For large runs, recommended running in background using `nohup`, for example:
 ```
 BACKGROUND=true nohup npx ts-node ./index.ts  \
-  -a lakename
+  -storestr "DefaultEndpointsProtocol=https;AccountName=xxxxxx;AccountKey=xxxxxx" \
+  -storecontainer "output" \
+  -a mylake
   -f filesystem
-  -sas "xxxxxxxxxxxxxxxxxxxxxxx"     
-  -dir /test &
+  -sas "lake sas"     
+  -dir /start/dir &
 ```
 
 ## Output
 
-Currently, the only supported output is local CSV files.  Work-in-progress to stream the data to Blob
+Output supported to either local files or Blob container, both in CSV format
 
  ### `paths.csv` 
  
