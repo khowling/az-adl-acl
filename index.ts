@@ -382,7 +382,7 @@ function args() {
     let argIdx = 2
     let nextparam
     let opts = []
-    opts['concurrency'] = 256
+    opts['concurrency'] = 128
     opts['continue'] = false
     opts['dir'] = "/"
     while (argIdx < process.argv.length) {
