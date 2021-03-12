@@ -1,4 +1,5 @@
 var sub = require('subleveldown')
+var lexint = require('lexicographic-integer');
 import { Atomic } from './atomic'
 
 const { Transform } = require('stream');
@@ -49,6 +50,14 @@ class MissingSequence extends Transform {
     }
 }
 
+export interface ControlData {
+    nextSequence: number;
+    nextToRun: number;
+    numberCompleted: number;
+    numberRunning: number;
+    metrics: Metrics;
+}
+
 export interface JobData {
     task: JobTask,
     path: string,
@@ -62,14 +71,14 @@ export enum JobTask {
 
 export interface JobReturn {
     status: JobStatus;
-    metrics: {
-        dirs: number;
-        files: number;
-        acls: number;
-    };
+    metrics?: Metrics;
     seq: number;
-    // Has the Job queued holding jobs?
-    holdingBatches?: number;
+}
+export interface Metrics {
+    dirs: number;
+    files: number;
+    acls: number;
+    errors: number;
 }
 
 export enum JobStatus {
@@ -77,7 +86,19 @@ export enum JobStatus {
     Error
 }
 
-const avro = require('avsc');
+export interface JobRunningData {
+    //status: JobRunningStatus;
+    completedBatches: number;
+}
+export enum JobRunningStatus {
+    Started,
+    Restart
+}
+
+const avro = require('avsc')
+const runningJobData = avro.Type.forValue({
+    completedBatches: 1
+})
 const queueJobData = avro.Type.forValue({
     task: 0,
     path: "/",
@@ -98,17 +119,14 @@ const holdingJobData = avro.Type.forValue([
 
 export class JobManager {
 
-    private _name
     private _db
-
     // sub leveldbs
     // main job queue
     private _queue
 
-    // holdingqueue - to allow the workerfn to write new jobs before returning.
-    private _holdingqueue
-    // record of completed tasks
-    private _complete
+    // Allow the workerfn to track progess before returning complete (for restarts to ensure not duplicating).
+    private _running
+
     // control state
     private _control
 
@@ -120,16 +138,12 @@ export class JobManager {
     private _nomore
 
 
-    constructor(name: string, db, concurrency: number, workerfn: (seq: number, d: JobData) => Promise<JobReturn>) {
-        this._name = name
+    constructor(db, concurrency: number, workerfn: (seq: number, d: JobData, r: JobRunningData) => Promise<JobReturn>) {
+
         this._db = db
         this._limit = concurrency
         this._workerFn = workerfn
         this._mutex = new Atomic(1)
-    }
-
-    get complete() {
-        return this._complete
     }
 
     async finishedSubmitting() {
@@ -138,44 +152,86 @@ export class JobManager {
     }
 
     // Needed for levelDB sequence key order :()
-    static inttoKey(i) {
-        return ('0000000000' + i).slice(-10)
-    }
+    //static inttoKey(i) {
+    //    return ('0000000000' + i).slice(-10)
+    //}
 
-    async start(reset: boolean = false) {
+    async start(continueRun: boolean = false) {
         // no job submissio processing
         let release = await this._mutex.aquire()
 
         this._nomore = false
-        this._complete = sub(this._db, `${this._name}_complete`, { valueEncoding: 'binary' })
-        this._queue = sub(this._db, `${this._name}_queue`, { valueEncoding: 'binary' })
-        this._holdingqueue = sub(this._db, `${this._name}_holdingqueue`, { valueEncoding: 'binary' })
-        this._control = sub(this._db, `${this._name}_control`, { valueEncoding: 'json' })
+        this._queue = sub(this._db, 'queue', {
+            keyEncoding: {
+                type: 'lexicographic-integer',
+                encode: (n) => lexint.pack(n, 'hex'),
+                decode: lexint.unpack,
+                buffer: false
+            },
+            valueEncoding: 'binary'
+        })
 
-        if (reset) {
-            console.log(`JobManager (${this._name}): Starting concurrency=${this._limit} (with reset)`)
-            await this.complete.clear()
+        this._running = sub(this._db, 'running', {
+            keyEncoding: {
+                type: 'lexicographic-integer',
+                encode: (n) => lexint.pack(n, 'hex'),
+                decode: lexint.unpack,
+                buffer: false
+            }, valueEncoding: 'binary'
+        })
+
+        this._control = sub(this._db, 'control', { valueEncoding: 'json' })
+
+        const controlInit: ControlData = {
+            nextSequence: 0,
+            nextToRun: 0,
+            numberCompleted: 0,
+            numberRunning: 0,
+            metrics: {
+                dirs: 0,
+                files: 0,
+                acls: 0,
+                errors: 0
+            }
+        }
+
+        if (!continueRun) {
+            console.log(`JobManager: Starting concurrency=${this._limit} (with reset)`)
             await this._queue.clear()
-            await this._holdingqueue.clear()
-
-            await this._control.put(0, {
-                nextSequence: 0,
-                nextToRun: 0,
-                numberCompleted: 0,
-                holdingBatches: 0,
-                metrics: {
-                    dirs: 0,
-                    files: 0,
-                    acls: 0
-                }
-            })
+            await this._running.clear()
+            await this._control.put(0, controlInit)
         } else {
-            const { nextSequence, nextToRun, numberCompleted } = await this._control.get(0)
-            const running = await this._getRunning(nextToRun)
-            console.log(`JobManager (${this._name}): continuing from :  nextToRun=${nextToRun}, numberCompleted=${numberCompleted}. Restarting running processes ${running.join(',')}...`)
 
-            for (let runningseq of running) {
-                await this.runit(runningseq, queueJobData.fromBuffer(await this._queue.get(runningseq)))
+            const { nextSequence, numberCompleted, numberRunning } = await new Promise((res, rej) => {
+                this._control.get(0, async (err, value) => {
+                    if (err) {
+                        if (err.notFound) {
+                            console.error(`Cannot continue, no previous run found (make sure you are in the correct directory)`)
+                            process.exit()
+                        }
+                    }
+                    res(value)
+                })
+            })
+
+            // Restart running processes
+
+            const rkeys: number[] = await new Promise((res, rej) => {
+                let runningKeys: number[] = []
+                const feed = this._running.createKeyStream().on('data', d => {
+                    runningKeys.push(d)
+                }).on('end', () => {
+                    res(runningKeys)
+                })
+            })
+
+            console.log(`JobManager: Starting: queued=${nextSequence} running=${numberRunning} completed=${numberCompleted}`)
+
+            if (rkeys.length > 0) {
+                console.log(`JobManager: Restarting : ${rkeys.join(',')}...`)
+                for (let key of rkeys) {
+                    await this.runit(key, queueJobData.fromBuffer(await this._queue.get(key)), runningJobData.fromBuffer(await this._running.get(key)))
+                }
             }
 
         }
@@ -183,8 +239,8 @@ export class JobManager {
 
         this._finishedPromise = new Promise(resolve => {
             const interval = setInterval(async () => {
-                const { nextSequence, nextToRun, numberCompleted, holdingBatches, metrics } = await this._control.get(0)
-                const log = `(${this._name}) files=${metrics.files} dirs=${metrics.dirs} acls=${metrics.acls} (holdingBatches=${holdingBatches} nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted})`
+                const { nextSequence, nextToRun, numberCompleted, numberRunning, metrics } = await this._control.get(0)
+                const log = `files=${metrics.files} dirs=${metrics.dirs} acls=${metrics.acls} errors=${metrics.errors} (queued=${nextSequence} running=${numberRunning} completed=${numberCompleted})`
                 if (!process.env.BACKGROUND) {
                     process.stdout.cursorTo(0); process.stdout.write(log)
                 } else {
@@ -198,77 +254,71 @@ export class JobManager {
             }, 1000)
         })
     }
-
-    private _getRunning(nextToRun: number): Promise<Array<number>> {
-        return new Promise((res, rej) => {
-
-            let ret: Array<number> = []
-            const p = this.complete.createKeyStream().pipe(new MissingSequence(nextToRun))
-
-            p.on('data', (d) => {
-                //console.log(`_getRunning ${parseInt(d)}`)
-                ret.push(parseInt(d))
+    /*
+        private _getRunning(nextToRun: number): Promise<Array<number>> {
+            return new Promise((res, rej) => {
+    
+                let ret: Array<number> = []
+                const p = this.complete.createKeyStream().pipe(new MissingSequence(nextToRun))
+    
+                p.on('data', (d) => {
+                    //console.log(`_getRunning ${parseInt(d)}`)
+                    ret.push(parseInt(d))
+                })
+                p.on('finish', () => res(ret))
+                p.on('error', (e) => rej(e))
+    
             })
-            p.on('finish', () => res(ret))
-            p.on('error', (e) => rej(e))
+    
+        }
+    */
 
-        })
-
-    }
-
-
-    private async checkRun(newWorkData?: JobData, completed?: JobReturn) {
+    private async checkRun(newWorkData?: JobData, completed?: JobReturn, passinRelease?) {
         //console.log(`checkRun - aquire newWorkData=${newWorkData} completed=${JSON.stringify(completed)}`)
-        let release = await this._mutex.aquire()
-        let { nextSequence, nextToRun, numberCompleted, metrics, holdingBatches } = await this._control.get(0)
 
-        let newWorkNext = newWorkData && nextToRun === nextSequence
+        let release = passinRelease || await this._mutex.aquire()
+        let { nextSequence, nextToRun, numberCompleted, numberRunning, metrics } = await this._control.get(0)
 
         if (completed) {
-
-            metrics = {
-                dirs: metrics.dirs + completed.metrics.dirs,
-                files: metrics.files + completed.metrics.files,
-                acls: metrics.acls + completed.metrics.acls
+            if (completed.metrics) {
+                metrics = {
+                    dirs: metrics.dirs + completed.metrics.dirs,
+                    files: metrics.files + completed.metrics.files,
+                    acls: metrics.acls + completed.metrics.acls,
+                    errors: metrics.errors + completed.metrics.errors
+                } as Metrics
             }
 
-            if (completed.holdingBatches && completed.holdingBatches > 0) {
-                // MOVE holding into _queue
-                for (let i = 0; i < completed.holdingBatches; i++) {
-                    const holdingkey = JobManager.inttoKey(completed.seq) + '-' + i
-                    //console.log(`moving holdingBatches holdingkey=${holdingkey}...`)
-                    const jobBatch = holdingJobData.fromBuffer(await this._holdingqueue.get(holdingkey))
-                    await this._queue.batch(jobBatch.map(j => { return { type: 'put', key: nextSequence++, value: queueJobData.toBuffer(j) } }))
-                    await this._holdingqueue.del(holdingkey)
-                    holdingBatches--
-                }
-            }
-
-
-            //console.log(`completed job : ${JSON.stringify(completed)}`)
-            await this._complete.put(JobManager.inttoKey(completed.seq), "1")
+            await this._running.del(completed.seq, '')
+            await this._queue.del(completed.seq, '')
+            numberRunning--
             numberCompleted++
 
-
         }
+
+        let newWorkNext = false
         if (newWorkData) {
+            newWorkNext = nextToRun === nextSequence
             await this._queue.put(nextSequence++, queueJobData.toBuffer(newWorkData))
         }
 
         // if we have NOT ran everything in the buffer && we are not at the maximum concurrency
         while (nextToRun < nextSequence && nextToRun - numberCompleted < this._limit) {
-            this.runit(nextToRun, newWorkNext ? newWorkData : queueJobData.fromBuffer(await this._queue.get(nextToRun)))
+            const runningData: JobRunningData = { /*status: JobRunningStatus.Started,*/ completedBatches: 0 }
+            await this._running.put(nextToRun, runningJobData.toBuffer(runningData))
+            numberRunning++
+            this.runit(nextToRun, newWorkNext ? newWorkData : queueJobData.fromBuffer(await this._queue.get(nextToRun)), runningData)
             nextToRun++
         }
 
-        await this._control.put(0, { nextSequence, nextToRun, numberCompleted, metrics, holdingBatches })
+        await this._control.put(0, { nextSequence, nextToRun, numberCompleted, numberRunning, metrics })
         //console.log(`checkRun - end: nextSequence=${nextSequence} nextToRun=${nextToRun} numberCompleted=${numberCompleted}`)
         release()
 
     }
 
-    private runit(seq: number, data) {
-        this._workerFn(seq, data).then(async (out) => {
+    private runit(seq: number, data: JobData, runningData: JobRunningData) {
+        this._workerFn(seq, data, runningData).then(async (out) => {
             await this.checkRun(null, out)
         }, async (e) => {
             console.error(e)
@@ -280,32 +330,30 @@ export class JobManager {
         await this.checkRun(data)
     }
 
-    async submitHolding(jobSequence: number, batchIdx: number, data: JobData[]): Promise<boolean> {
+    async runningCompleteBatch(jobSequence: number, batchIdx: number, batchMetrics: Metrics, newJobs: JobData[]) {
 
-        if (data && data.length > 0) {
-            let release = await this._mutex.aquire()
+        const release = await this._mutex.aquire()
 
-            let ctl = await this._control.get(0)
-            ctl.holdingBatches = ctl.holdingBatches + 1
-            const batchkey = JobManager.inttoKey(jobSequence) + '-' + batchIdx
+        let { nextSequence, nextToRun, numberCompleted, numberRunning, metrics }: ControlData = await this._control.get(0)
 
-            const alreadyExistis: boolean = await new Promise((res, rej) => {
-                this._holdingqueue.get(batchkey, (err, value) => {
-                    if (err) {
-                        if (err.notFound) {
-                            res(false)
-                        }
-                    }
-                    res(true)
-                })
-            })
-            if (!alreadyExistis) {
-                await this._holdingqueue.put(batchkey, holdingJobData.toBuffer(data))
-                await this._control.put(0, ctl)
-            }
-            release()
-            // return true if holding inserted OK, return false, if already a holding job for this job (for a unclear restart to ensure the job knows its alrady been done!)
-            return alreadyExistis
+        // Update batch metrics
+        if (batchMetrics) {
+            metrics = {
+                dirs: metrics.dirs + batchMetrics.dirs,
+                files: metrics.files + batchMetrics.files,
+                acls: metrics.acls + batchMetrics.acls,
+                errors: metrics.errors + batchMetrics.errors
+            } as Metrics
         }
+
+        // update _running job status, so in restart will not re-run completed batches
+        await this._running.put(jobSequence, runningJobData.toBuffer({ completedBatches: batchIdx + 1 }))
+        // add the newJobs to the _queue
+        await this._queue.batch(newJobs.map(j => { return { type: 'put', key: nextSequence++, value: queueJobData.toBuffer(j) } }))
+        // update the control
+        await this._control.put(0, { nextSequence, nextToRun, numberCompleted, numberRunning, metrics } as ControlData)
+
+        await this.checkRun(null, null, release)
     }
+
 }

@@ -171,7 +171,7 @@ class ACLsCSV extends Transform {
 const avro = require('avsc');
 const level = require('level')
 var sub = require('subleveldown')
-import { JobManager, JobStatus, JobReturn, JobData, JobTask } from './jobmanager'
+import { JobManager, JobStatus, JobReturn, JobData, JobTask, JobRunningData } from './jobmanager'
 
 const pathType = avro.Type.forValue({
     name: "dir1",
@@ -228,74 +228,78 @@ const aclType2 = avro.Type.forValue({
     ]
 })
 
-async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, startDir: string, reset: boolean) {
+async function writePathsRestartableConcurrent(fileSystemClient: DataLakeFileSystemClient, startDir: string, continueRun: boolean) {
 
     var db = level('./mydb')
 
     //const pathsdb = sub(db, 'paths', { valueEncoding: 'binary' })
     //const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
-    if (reset) {
+    if (!continueRun) {
         await fs.promises.writeFile('./paths.csv', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
         await fs.promises.writeFile('./acls.csv', 'Filepath,Type,Entity,Read,Write,Execute' + "\n")
+        await fs.promises.writeFile('./errors.csv', 'TaskSequence,TaskType,Path,Error' + "\n")
     }
 
-    const paths_q = new JobManager("paths", db, 50, async function (seq: number, d: JobData): Promise<JobReturn> {
-
+    const paths_q = new JobManager(db, 50, async function (seq: number, d: JobData, r: JobRunningData): Promise<JobReturn> {
+        let currentBatch = 0
         try {
-            let dirs = 0, files = 0, acls = 0, holdingBatches = 0
-
             if (d.task === JobTask.ListPaths) {
                 for await (const response of fileSystemClient.listPaths({ path: d.path, recursive: false }).byPage({ maxPageSize: 10000 })) {
                     if (response.pathItems) {
-                        let holdingJobData: Array<JobData> = []
+                        let dirs = 0, files = 0, acls = 0, errors = 0
+                        let newJobs: Array<JobData> = []
                         for (const path of response.pathItems) {
 
-                            holdingJobData.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory })
+                            newJobs.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory })
                             if (path.isDirectory) {
                                 dirs++
-                                holdingJobData.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory })
+                                newJobs.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory })
                             } else {
                                 files++
                             }
                             //await pathsdb.put(path.name, pathType.toBuffer(path))                        
                         }
 
-                        if (holdingJobData.length > 0) {
-                            const alreadyExistis = await paths_q.submitHolding(seq, holdingBatches++, holdingJobData)
+                        // 
+                        if (currentBatch >= r.completedBatches) {
+                            //const alreadyExistis = await paths_q.submitHolding(seq, currentBatch++, newJobs)
                             // if already exists, may be from a restart, and the full job didnt move from the holding queue, so dont re-write the file!
-                            if (!alreadyExistis) {
-                                await fs.promises.appendFile('./paths.csv', response.pathItems.map(path => {
-                                    const lastidx = path.name.lastIndexOf('/')
-                                    return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
-                                }).join("\n") + "\n")
-                            }
+                            //if (!alreadyExistis) {
+                            await fs.promises.appendFile('./paths.csv', response.pathItems.map(path => {
+                                const lastidx = path.name.lastIndexOf('/')
+                                return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
+                            }).join("\n") + "\n")
+                            await paths_q.runningCompleteBatch(seq, currentBatch++, { files, acls, errors, dirs }, newJobs)
+                            //}
                         }
 
                     }
                 }
+                return { seq, status: JobStatus.Success }
 
             } else if (d.task === JobTask.GetACLs) {
-
+                let acls = 0
                 const permissions = d.isDirectory ? await fileSystemClient.getDirectoryClient(d.path).getAccessControl() : await fileSystemClient.getFileClient(d.path).getAccessControl()
                 //await aclsdb.put(d.path, aclType2.toBuffer({ path: d.path, acls: permissions.acl }))
                 for (const p of permissions.acl) {
                     acls++
                     await fs.promises.appendFile('./acls.csv', `${d.path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
                 }
-
+                return { seq, status: JobStatus.Success, metrics: { files: 0, dirs: 0, errors: 0, acls } }
             } else {
                 throw new Error(`Unknown JobTask ${d.task}`)
             }
 
-            return { seq, status: JobStatus.Success, metrics: { acls, dirs, files }, holdingBatches }
-        } catch (e) {
-            console.error(e)
-            process.exit(1)
+        } catch (err) {
+
+            await fs.promises.appendFile('./errors.csv', `${seq},${d.task},${d.path},${JSON.stringify(err)}` + "\n")
+            console.error(`Job Error: seq=${seq}, task=${d.task}, err=${JSON.stringify(err)}`)
+            return { seq, status: JobStatus.Error, metrics: { files: 0, dirs: 0, errors: 1, acls: 0 } }
         }
     })
 
-    await paths_q.start(reset)
-    if (reset) {
+    await paths_q.start(continueRun)
+    if (!continueRun) {
 
         //await pathsdb.clear()
         console.log(`Seeding path startDir=${startDir}`)
@@ -369,8 +373,8 @@ function args() {
     function usage(e?) {
         if (e) console.log(e)
         console.log('usage:')
-        console.log(`    ${process.argv[0]} ${process.argv[1]} -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [-dir <starting directory] [-R]`)
-        console.log(`         -R   :  Reset, clear the current run progress & start from begining`)
+        console.log(`    ${process.argv[0]} ${process.argv[1]} -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [-dir <starting directory] [-continue]`)
+        console.log(`         -continue   :  Reset, clear the current run progress & start from begining`)
         console.log(`         -dir :  Starting point for ACL extraction (default "/")`)
         process.exit(1)
     }
@@ -378,7 +382,7 @@ function args() {
     let argIdx = 2
     let nextparam
     let opts = []
-    opts['reset'] = false
+    opts['continue'] = false
     opts['dir'] = "/"
     while (argIdx < process.argv.length) {
         switch (process.argv[argIdx]) {
@@ -397,8 +401,8 @@ function args() {
             case '-dir':
                 nextparam = 'dir'
                 break
-            case '-R':
-                opts['reset'] = true
+            case '-continue':
+                opts['continue'] = true
                 break
             default:
                 if (/^-/.test(process.argv[argIdx])) {
@@ -446,7 +450,7 @@ async function main() {
     //console.log("sas token" + serviceClient.generateAccountSasUrl(new Date(Date.now() + (3600 * 1000 * 24)), AccountSASPermissions.parse('rwlacup'), "s"))
 
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
-    await writePathsRestartableConcurrent(fileSystemClient, opts['dir'], opts['reset'])
+    await writePathsRestartableConcurrent(fileSystemClient, opts['dir'], opts['continue'])
 }
 
 main()
