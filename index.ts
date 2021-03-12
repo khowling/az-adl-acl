@@ -254,7 +254,7 @@ class WriteAppendBlobs {
         const cc = this.cachedClients[blob]
         let { seq, block, size, path } = await this.blobs.get(blob)
         // Each block in an append blob can be a different size, up to a maximum of 4 MB, and an append blob can include up to 50,000 blocks. 
-        if (block > 40000 || size + length > 150000000000) {
+        if (block > 49990 || size + length > 150000000000) {
             seq++; block = 0; size = length
             this.cachedClients[blob] = this.containerClient.getAppendBlobClient(`${path}.${seq}.csv`)
             await this.cachedClients[blob].createIfNotExists()
