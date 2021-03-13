@@ -212,7 +212,7 @@ export class JobManager {
             })
 
             // Restart running processes
-            console.log(`JobManager: Re-starting: queued=${nextSequence} running=${numberRunning} completed=${numberCompleted}`)
+            console.log(`JobManager: Re-starting: queued=${nextSequence} running=${numberRunning} completed=${numberCompleted} nextToRun=${nextToRun}`)
 
 
             // Check there have been running processes
@@ -228,7 +228,7 @@ export class JobManager {
                     })
                 })
 
-                assert.deepStrictEqual(rkeys.length, numberRunning, `JobManager: restarting running jobs error expeccted numberRunning=${numberRunning}, got ${rkeys.length} in queue`)
+                //assert.deepStrictEqual(rkeys.length, numberRunning, `JobManager: restarting running jobs error expeccted numberRunning=${numberRunning}, got ${rkeys.length} in queue`)
 
                 if (rkeys.length > 0) {
                     console.log(`JobManager: Restarting : ${rkeys.join(',')}...`)
