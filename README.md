@@ -17,10 +17,15 @@ NOTE: Recomendations for large Datalakes (>10million objects):
 
 ## Usage
 
-NOTE: ensure you install dependencies using `$ npm i` before running: 
+NOTE: ensure you install dependencies & complile typescript  before running
+
+        ```
+        npm i
+        npx tsc
+        ```
 
 ```
-npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [ -storestr <connection str>  -storecontainer <blob container> ] [-dir <starting directory] [-continue]
+node ./out/index.js -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ] [ -storestr <connection str>  -storecontainer <blob container> ] [-dir <starting directory] [-continue]
 
     -storestr & -storecontainer   :  Azure Blob Storage Account connection string and container (if not provided, output to local dir)
     -continue                     :  Continue last run from where it left off
@@ -29,13 +34,13 @@ npx ts-node ./index.ts -a <ADL account name> -f <ADL filesystem name> [-sas <SAS
 
 For large runs, recommended running in background using `nohup`, for example:
 ```
-BACKGROUND=true nohup npx ts-node ./index.ts  \
+BACKGROUND=true nohup node ./out/index.js  \
+  -a mylake \
+  -f filesystem \
+  -sas "lake sas"  \
+  -dir /start/dir \
   -storestr "DefaultEndpointsProtocol=https;AccountName=xxxxxx;AccountKey=xxxxxx" \
-  -storecontainer "output" \
-  -a mylake
-  -f filesystem
-  -sas "lake sas"     
-  -dir /start/dir &
+  -storecontainer "output"
 ```
 
 ## Output
@@ -47,13 +52,15 @@ Output supported to either local files or Blob container, both in CSV format
  Contains the output of this `listPaths` API call for each object in the datalake under the passed in directory: https://docs.microsoft.com/en-us/rest/api/storageservices/datalakestoragegen2/filesystem/listpaths
 
         ```
-        isDirectory,Filepath,Path,Name,Owner,Group
-        true,dir1,,dir1,$superuser,$superuser
-        true,fivedirtop0,,fivedirtop0,$superuser,$superuser
-        true,fivedirtop1,,fivedirtop1,$superuser,$superuser
-        true,fivedirtop2,,fivedirtop2,$superuser,$superuser
-        true,fivedirtop3,,fivedirtop3,$superuser,$superuser
-        true,fivedirtop4,,fivedirtop4,$superuser,$superuser
+        isDirectory,Name,Owner,Group,OnwerPermissions,GroupPermissions,ExecutePermissions
+        true,"dir1",$superuser,$superuser,RRR,R-R,---
+        true,"tendirtop8",$superuser,$superuser,RRR,R-R,---
+        true,"tendirtop9",$superuser,$superuser,RRR,R-R,---
+        false,"dir1/newfile1615214993252",$superuser,$superuser,RR-,R--,---
+        false,"dir1/newfile1615215601371",$superuser,$superuser,RR-,R--,---
+        false,"dir1/newfile1615216127229",$superuser,$superuser,RR-,R--,---
+        true,"fivedirtop1/fivedirmiddle0",$superuser,$superuser,RRR,R-R,---
+        true,"fivedirtop1/fivedirmiddle1",$superuser,$superuser,RRR,R-R,---
         ```
 ### `acls.csv` 
 

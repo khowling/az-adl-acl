@@ -128,7 +128,7 @@ async function getALCs(fileSystemClient: DataLakeFileSystemClient, release, file
 
 }
 
-*/
+
 
 const { Transform } = require('stream');
 class PathsCSV extends Transform {
@@ -174,10 +174,8 @@ class ACLsCSV extends Transform {
 }
 
 
+
 const avro = require('avsc');
-const level = require('level')
-var sub = require('subleveldown')
-import { JobManager, JobStatus, JobReturn, JobData, JobTask, JobRunningData } from './jobmanager'
 
 const pathType = avro.Type.forValue({
     name: "dir1",
@@ -233,6 +231,12 @@ const aclType2 = avro.Type.forValue({
         }
     ]
 })
+
+*/
+
+const level = require('level')
+var sub = require('subleveldown')
+import { JobManager, JobStatus, JobReturn, JobData, JobTask, JobRunningData } from './jobmanager'
 
 
 class WriteAppendBlobs {
@@ -293,49 +297,60 @@ class WriteAppendBlobs {
 
 }
 
+//const PATH_HEADER = 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n"
+const PATH_HEADER = 'isDirectory,Name,Owner,Group,OnwerPermissions,GroupPermissions,ExecutePermissions' + "\n"
+const ACL_HEADER = 'Filepath,DefaultScope,Type,Entity,Read,Write,Execute' + "\n"
+const ERR_HEADER = 'TaskSequence,TaskType,Path,Error' + "\n"
+
 async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean, azBlob?: WriteAppendBlobs) {
 
+    if (azBlob) {
+        await azBlob.init(['paths', 'acls', 'errors'], continueRun)
+    }
 
     if (!continueRun) {
         if (azBlob) {
-            await azBlob.init(['paths', 'acls', 'errors'], continueRun)
-            await azBlob.write('paths', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
-            await azBlob.write('acls', 'Filepath,Type,Entity,Read,Write,Execute' + "\n")
-            await azBlob.write('errors', 'TaskSequence,TaskType,Path,Error' + "\n")
+            await azBlob.write('paths', PATH_HEADER)
+            await azBlob.write('acls', ACL_HEADER)
+            await azBlob.write('errors', ERR_HEADER)
         } else {
-            await fs.promises.writeFile('./paths.csv', 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
-            await fs.promises.writeFile('./acls.csv', 'Filepath,Type,Entity,Read,Write,Execute' + "\n")
-            await fs.promises.writeFile('./errors.csv', 'TaskSequence,TaskType,Path,Error' + "\n")
+            await fs.promises.writeFile('./paths.csv', PATH_HEADER)
+            await fs.promises.writeFile('./acls.csv', ACL_HEADER)
+            await fs.promises.writeFile('./errors.csv', ERR_HEADER)
         }
     }
 
 
-    const paths_q = new JobManager(db, concurrency, async function (seq: number, d: JobData, r: JobRunningData): Promise<JobReturn> {
-        let currentBatch = 0
+    const paths_q = new JobManager(db, concurrency, async function (seq: number, d: JobData): Promise<JobReturn> {
+        let batchCompleteIdx = 0
+        let metrics = { dirs: 0, files: 0, acls: 0, errors: 0 }
+        const status = JobStatus.Success
         try {
             if (d.task === JobTask.ListPaths) {
                 for await (const response of fileSystemClient.listPaths({ path: d.path, recursive: false }).byPage({ maxPageSize: 10000 })) {
                     if (response.pathItems) {
-                        let dirs = 0, files = 0, acls = 0, errors = 0
+
                         let newJobs: Array<JobData> = []
                         for (const path of response.pathItems) {
 
-                            newJobs.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory })
+                            newJobs.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory, completedBatches: 0 })
                             if (path.isDirectory) {
-                                dirs++
-                                newJobs.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory })
+                                metrics.dirs++
+                                newJobs.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory, completedBatches: 0 })
                             } else {
-                                files++
+                                metrics.files++
                             }
                             //await pathsdb.put(path.name, pathType.toBuffer(path))                        
                         }
 
                         // 
-                        if (currentBatch >= r.completedBatches) {
+                        if (batchCompleteIdx >= d.completedBatches) {
 
                             const body = response.pathItems.map(path => {
-                                const lastidx = path.name.lastIndexOf('/')
-                                return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
+                                //const lastidx = path.name.lastIndexOf('/')
+                                //return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
+                                const { owner, group, other } = path.permissions
+                                return `${path.isDirectory},"${path.name}",${path.owner},${path.group},${owner.read ? 'r' : '-'}${owner.write ? 'w' : '-'}${owner.execute ? 'x' : '-'},${group.read ? 'r' : '-'}${group.write ? 'w' : '-'}${group.execute ? 'x' : '-'},${other.read ? 'r' : '-'}${other.write ? 'w' : '-'}${other.execute ? 'x' : '-'}`
                             }).join("\n") + "\n"
 
                             if (azBlob) {
@@ -344,29 +359,31 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
                                 await fs.promises.appendFile('./paths.csv', body)
                             }
 
-                            await paths_q.runningCompleteBatch(seq, currentBatch++, { files, acls, errors, dirs }, newJobs)
+                            await paths_q.runningCompleteBatch({ seq, updateJobData: { ...d, completedBatches: batchCompleteIdx + 1 } as JobData, status, metrics, newJobs })
                             //}
                         }
+                        metrics = { dirs: 0, files: 0, acls: 0, errors: 0 }
+                        batchCompleteIdx++
 
                     }
                 }
-                return { seq, status: JobStatus.Success }
+                return { seq, status, metrics }
 
             } else if (d.task === JobTask.GetACLs) {
 
                 const permissions = d.isDirectory ? await fileSystemClient.getDirectoryClient(d.path).getAccessControl() : await fileSystemClient.getFileClient(d.path).getAccessControl()
-                let acls = permissions.acl.length
+                metrics.acls = permissions.acl.length
 
-                const body = permissions.acl.map(p => `${d.path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}`).join("\n") + "\n"
+                const body = permissions.acl.map(p => `"${d.path}",${p.defaultScope},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}`).join("\n") + "\n"
 
                 if (azBlob) {
                     await azBlob.write('acls', body)
                 } else {
                     await fs.promises.appendFile('./acls.csv', body)
                 }
-                return { seq, status: JobStatus.Success, metrics: { files: 0, dirs: 0, errors: 0, acls } }
+                return { seq, status, metrics }
             } else {
-                throw new Error(`Unknown JobTask ${d.task}`)
+                throw new Error(`Unknown JobTask ${d.task}, program error`)
             }
 
         } catch (err) {
@@ -377,7 +394,8 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
                 await fs.promises.appendFile('./errors.csv', body)
             }
             console.error(`Job Error: seq=${seq}, task=${d.task}, err=${JSON.stringify(err)}`)
-            return { seq, status: JobStatus.Error, metrics: { files: 0, dirs: 0, errors: 1, acls: 0 } }
+            metrics.errors++
+            return { seq, status: JobStatus.Error, metrics }
         }
     })
 
@@ -386,7 +404,7 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
 
         //await pathsdb.clear()
         console.log(`Seeding path startDir=${startDir}`)
-        await paths_q.submit({ task: JobTask.ListPaths, path: startDir, isDirectory: true })
+        await paths_q.submit({ task: JobTask.ListPaths, path: startDir, isDirectory: true, completedBatches: 0 })
     }
     await paths_q.finishedSubmitting()
 
