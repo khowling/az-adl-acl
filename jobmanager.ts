@@ -1,8 +1,10 @@
-var sub = require('subleveldown')
+
 var lexint = require('lexicographic-integer');
+
 import { assembleProtocol } from 'avsc/types';
 import { Atomic } from './atomic'
-
+import level, { LevelUp } from 'levelup'
+import sub from 'subleveldown'
 /*
 const { Transform } = require('stream');
 
@@ -89,7 +91,7 @@ export enum JobStatus {
     Success,
     Error
 }
-
+/*
 export interface JobRunningData {
     //status: JobRunningStatus;
     completedBatches: number;
@@ -98,7 +100,7 @@ export enum JobRunningStatus {
     Started,
     Restart
 }
-
+*/
 const avro = require('avsc')
 /*
 const runningJobData = avro.Type.forValue({
@@ -120,43 +122,28 @@ export class JobManager {
 
     // sub leveldbs
     // main job queue
-    private _queue
+    private _queue: LevelUp
     // Allow the workerfn to track progess before returning complete (for restarts to ensure not duplicating).
     //private _running
 
     // control state
-    private _control
+    private _control: LevelUp
 
 
     private _limit
     private _workerFn
     private _mutex
-    private _finishedPromise
-    private _nomore
+    private _finishedPromise: Promise<boolean> | null
+    private _nomore: boolean
 
 
-    constructor(db, concurrency: number, workerfn: (seq: number, d: JobData, r: JobRunningData) => Promise<JobReturn>) {
+    constructor(db: LevelUp, concurrency: number, workerfn: (seq: number, d: JobData/*, r: JobRunningData*/) => Promise<JobReturn>) {
 
         this._db = db
         this._limit = concurrency
         this._workerFn = workerfn
         this._mutex = new Atomic(1)
-    }
-
-    async finishedSubmitting() {
-        this._nomore = true
-        return await this._finishedPromise
-    }
-
-    // Needed for levelDB sequence key order :()
-    //static inttoKey(i) {
-    //    return ('0000000000' + i).slice(-10)
-    //}
-
-    async start(continueRun: boolean = false) {
-        // no job submissio processing
-        let release = await this._mutex.aquire()
-
+        this._finishedPromise = null
         this._nomore = false
         this._queue = sub(this._db, 'queue', {
             keyEncoding: {
@@ -179,6 +166,22 @@ export class JobManager {
         */
         this._control = sub(this._db, 'control', { valueEncoding: 'json' })
 
+    }
+
+    async finishedSubmitting() {
+        this._nomore = true
+        return await this._finishedPromise
+    }
+
+    // Needed for levelDB sequence key order :()
+    //static inttoKey(i) {
+    //    return ('0000000000' + i).slice(-10)
+    //}
+
+    async start(continueRun: boolean = false) {
+        // no job submissio processing
+        let release = await this._mutex.aquire()
+
         const controlInit: ControlData = {
             nextSequence: 0,
             nextToRun: 0,
@@ -200,7 +203,7 @@ export class JobManager {
         } else {
 
             const { nextSequence, numberCompleted, numberRunning, nextToRun } = await new Promise((res, rej) => {
-                this._control.get(0, async (err, value) => {
+                this._control.get(0, async (err: any, value) => {
                     if (err) {
                         if (err.notFound) {
                             console.error(`Cannot continue, no previous run found (make sure you are in the correct directory)`)
@@ -288,7 +291,7 @@ export class JobManager {
         }
     }
 
-    private async checkRun(newData?: JobData, batchData?: JobReturn, completed?: JobReturn) {
+    private async checkRun(newData?: JobData | null, batchData?: JobReturn | null, completed?: JobReturn) {
         //console.log(`checkRun - aquire newData=${newData} completed=${JSON.stringify(completed)}`)
 
         let release = await this._mutex.aquire()

@@ -8,11 +8,12 @@ export interface AtomicInterface {
 export class Atomic implements AtomicInterface {
 
     private _queue: Array<(lease: [number, () => void]) => void> = [];
-    private _currentReleaser: () => void | undefined;
+    private _currentReleaser: undefined | (() => void);
     private _value: number = 1;
 
     constructor(concurrency: number) {
         this._value = concurrency
+        this._currentReleaser = undefined
     }
 
     isLocked() {

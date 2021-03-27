@@ -1,5 +1,5 @@
 const fs = require('fs')
-
+var lexint = require('lexicographic-integer');
 
 import { Atomic } from './atomic'
 import {
@@ -11,7 +11,8 @@ import {
     ListPathsOptions,
     DataLakeFileSystemClient,
     StoragePipelineOptions,
-    StorageSharedKeyCredential
+    StorageSharedKeyCredential,
+    PathPermissions
 } from "@azure/storage-file-datalake"
 
 import {
@@ -234,67 +235,105 @@ const aclType2 = avro.Type.forValue({
 
 */
 
-const level = require('level')
-var sub = require('subleveldown')
-import { JobManager, JobStatus, JobReturn, JobData, JobTask, JobRunningData } from './jobmanager'
+import level, { LevelUp } from 'levelup'
+var leveldown = require('leveldown')
+import sub from 'subleveldown'
+
+import { JobManager, JobStatus, JobReturn, JobData, JobTask } from './jobmanager'
 
 
 class WriteAppendBlobs {
 
-    private blobs
-    private containerClient
-    private cachedClients = {}
-    private _mutexs = {}
+    private _db: LevelUp
+    private blobs: LevelUp
+    private containerClient: ContainerClient
+    private cachedClients: { [key: string]: AppendBlobClient } = {}
+    private cachedContent: { [key: string]: LevelUp } = {}
+    private _mutexs: { [key: string]: Atomic } = {}
 
+    private static APPEND_BLOCK_SIZE = 4194304
 
-    constructor(db, connectionStr: string, container: string) {
-
+    constructor(db: LevelUp, connectionStr: string, container: string) {
+        this._db = db
         this.blobs = sub(db, 'blobs', { valueEncoding: 'json' })
         const blobServiceClient = BlobServiceClient.fromConnectionString(connectionStr);
         this.containerClient = blobServiceClient.getContainerClient(container)
     }
 
-    private async getClient(blob: string, length: number): Promise<AppendBlobClient> {
-        const cc = this.cachedClients[blob]
-        let { seq, block, size, path } = await this.blobs.get(blob)
-        // Each block in an append blob can be a different size, up to a maximum of 4 MB, and an append blob can include up to 50,000 blocks. 
-        if (block > 49990 || size + length > 150000000000) {
-            seq++; block = 0; size = length
-            this.cachedClients[blob] = this.containerClient.getAppendBlobClient(`${path}.${seq}.csv`)
-            await this.cachedClients[blob].createIfNotExists()
-        } else {
-            block = block + 1; size = size + length
-            if (!this.cachedClients[blob]) {
-                this.cachedClients[blob] = this.containerClient.getAppendBlobClient(`${path}.${seq}.csv`)
+    // if no body, just flush
+    async write(blob: string, body?: string): Promise<void> {
+
+        const length = body ? body.length : 0
+
+        let release = await this._mutexs[blob].aquire()
+
+        let { cacheSeq, cacheSize, blobNumber, blockNumber/*, blockSize*/, path } = await this.blobs.get(blob)
+
+        if (cacheSize + length > WriteAppendBlobs.APPEND_BLOCK_SIZE || length === 0) {
+            // flush cache to block
+
+            // Each blockNumber in an append blob can be a different size, up to a maximum of 4 MB, and an append blob can include up to 50,000 blocks. 
+            if (blockNumber > 49990 /*|| blockSize + length > 150000000000*/) {
+                // current Blob is at maximum size, so create a new blob client
+                blobNumber++; blockNumber = 0; /* blockSize = length*/
+                this.cachedClients[blob] = this.containerClient.getAppendBlobClient(`${path}.${blobNumber}.csv`)
                 await this.cachedClients[blob].createIfNotExists()
+            } else {
+                // just return cached client.
+                blockNumber = blockNumber + 1; /*blockSize = blockSize + length*/
+                if (!this.cachedClients[blob]) {
+                    this.cachedClients[blob] = this.containerClient.getAppendBlobClient(`${path}.${blobNumber}.csv`)
+                    await this.cachedClients[blob].createIfNotExists()
+                }
             }
+
+            // got blob client to write to
+            const writestrarr: string[] = await new Promise((res, rej) => {
+                const buff: string[] = []
+                this.cachedContent[blob].createValueStream({ lt: cacheSeq })
+                    .on('data', d => buff.push(d))
+                    .on('end', () => {
+                        console.log('finished "acls.csv"')
+                        res(buff)
+                    })
+            })
+
+            const flushstr = writestrarr.join()
+            this.cachedClients[blob].appendBlock(flushstr, flushstr.length)
+            cacheSeq = 0; cacheSize = 0
         }
-        await this.blobs.put(blob, { seq, block, size, path })
-        return this.cachedClients[blob]
+
+        // add body to cache
+        if (length > 0) {
+            await this.cachedContent[blob].put(cacheSeq++, body)
+            cacheSize = cacheSize + length
+        }
+
+        await this.blobs.put(blob, { cacheSeq, cacheSize, blobNumber, blockNumber/*, blockSize*/, path })
+        release()
     }
 
     async init(blobs: string[], continueRun: boolean) {
         for (const b of blobs) {
             this._mutexs[b] = new Atomic(1)
+            this.cachedContent[b] = sub(this._db, `cache${b}`, {
+                keyEncoding: {
+                    type: 'lexicographic-integer',
+                    encode: (n) => lexint.pack(n, 'hex'),
+                    decode: lexint.unpack,
+                    buffer: false
+                },
+                valueEncoding: 'utf8'
+            })
         }
 
         if (!continueRun) {
             const d = new Date()
             for (const b of blobs) {
-                await this.blobs.put(b, { seq: 0, block: 0, size: 0, path: `${d.toISOString()}/${b}` })
+                await this.blobs.put(b, { cacheSeq: 0, cacheSize: 0, blobNumber: 0, blockNumber: 0, blockSize: 0, path: `${d.toISOString()}/${b}` })
             }
         }
     }
-
-    async write(blob: string, body: string) {
-        let release = await this._mutexs[blob].aquire()
-        const c = await this.getClient(blob, body.length)
-        await c.appendBlock(body, body.length)
-        release()
-
-    }
-
-
 }
 
 //const PATH_HEADER = 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n"
@@ -302,7 +341,7 @@ const PATH_HEADER = 'isDirectory,Name,Owner,Group,OnwerPermissions,GroupPermissi
 const ACL_HEADER = 'Filepath,DefaultScope,Type,Entity,Read,Write,Execute' + "\n"
 const ERR_HEADER = 'TaskSequence,TaskType,Path,Error' + "\n"
 
-async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean, azBlob?: WriteAppendBlobs) {
+async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean, azBlob?: WriteAppendBlobs) {
 
     if (azBlob) {
         await azBlob.init(['paths', 'acls', 'errors'], continueRun)
@@ -333,10 +372,10 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
                         let newJobs: Array<JobData> = []
                         for (const path of response.pathItems) {
 
-                            newJobs.push({ task: JobTask.GetACLs, path: path.name, isDirectory: path.isDirectory, completedBatches: 0 })
+                            newJobs.push({ task: JobTask.GetACLs, path: path.name as string, isDirectory: path.isDirectory as boolean, completedBatches: 0 })
                             if (path.isDirectory) {
                                 metrics.dirs++
-                                newJobs.push({ task: JobTask.ListPaths, path: path.name, isDirectory: path.isDirectory, completedBatches: 0 })
+                                newJobs.push({ task: JobTask.ListPaths, path: path.name as string, isDirectory: path.isDirectory, completedBatches: 0 })
                             } else {
                                 metrics.files++
                             }
@@ -349,7 +388,7 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
                             const body = response.pathItems.map(path => {
                                 //const lastidx = path.name.lastIndexOf('/')
                                 //return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
-                                const { owner, group, other } = path.permissions
+                                const { owner, group, other } = path.permissions as PathPermissions
                                 return `${path.isDirectory},"${path.name}",${path.owner},${path.group},${owner.read ? 'r' : '-'}${owner.write ? 'w' : '-'}${owner.execute ? 'x' : '-'},${group.read ? 'r' : '-'}${group.write ? 'w' : '-'}${group.execute ? 'x' : '-'},${other.read ? 'r' : '-'}${other.write ? 'w' : '-'}${other.execute ? 'x' : '-'}`
                             }).join("\n") + "\n"
 
@@ -408,6 +447,12 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
     }
     await paths_q.finishedSubmitting()
 
+    // flushing cached data to blobs
+    if (azBlob) {
+        await azBlob.write('paths')
+        await azBlob.write('acls')
+        await azBlob.write('errors')
+    }
 
     /*
         const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
@@ -469,9 +514,11 @@ async function writePathsRestartableConcurrent(db, fileSystemClient: DataLakeFil
     db.close(() => console.log('closing job manager'))
 }
 
+type ProgramArgKeys = 'concurrency' | 'continue' | 'dir' | 'storeConnectionStr' | 'storeContainer' | 'accountName' | 'filesystemName' | 'sas' | 'key';
+
 function args() {
 
-    function usage(e?) {
+    function usage(e?: string) {
         if (e) console.log(e)
         console.log('usage:')
         console.log(`    ${process.argv[0]} ${process.argv[1]} -a <ADL account name> -f <ADL filesystem name> [-sas <SAS> | -key <key> ]  [ -storestr <connection str>  -storecontainer <blob container> ] [-dir <starting directory] [-continue]`)
@@ -482,12 +529,13 @@ function args() {
         process.exit(1)
     }
 
-    let argIdx = 2
-    let nextparam
-    let opts = []
-    opts['concurrency'] = 128
-    opts['continue'] = false
-    opts['dir'] = "/"
+    let opts: { [index in ProgramArgKeys]?: string } = {
+        concurrency: '128',
+        continue: 'false',
+        dir: '/'
+    }
+
+    let argIdx: number = 2, nextparam: ProgramArgKeys | null = null
     while (argIdx < process.argv.length) {
         switch (process.argv[argIdx]) {
             case '-storestr':
@@ -515,15 +563,19 @@ function args() {
                 nextparam = 'dir'
                 break
             case '-continue':
-                opts['continue'] = true
+                opts['continue'] = 'true'
                 break
             default:
-                if (/^-/.test(process.argv[argIdx])) {
-                    usage(`unknown argument ${process.argv[argIdx]}`)
+                const value = process.argv[argIdx]
+                if (/^-/.test(value)) {
+                    usage(`unknown argument ${value}`)
                 } else if (nextparam) {
-                    opts[nextparam] = process.argv[argIdx]
+                    if ('concurrency' === nextparam && isNaN(value as any)) {
+                        usage(`-c requires a number`)
+                    }
+                    opts[nextparam] = value
                 } else {
-                    usage(`unknown argument ${process.argv[argIdx]}`)
+                    usage(`unknown argument ${value}`)
                 }
                 nextparam = null
         }
@@ -560,13 +612,13 @@ async function main() {
         }
     */
 
-    const accountName = opts['accountName'],
-        fileSystemName = opts['filesystemName'],
+    const accountName = opts['accountName'] as string,
+        fileSystemName = opts['filesystemName'] as string,
         adlurl = `https://${accountName}.dfs.core.windows.net` + (opts['sas'] ? `?${opts['sas']}` : ''),
-        serviceClient = new DataLakeServiceClient(adlurl, opts['key'] ? new StorageSharedKeyCredential(accountName, opts['key']) : undefined, opt)
+        serviceClient = new DataLakeServiceClient(adlurl, opts['key'] ? new StorageSharedKeyCredential(accountName, opts['key']) : undefined /*, opt*/)
 
 
-    const db = level('./mydb')
+    const db = level(leveldown('./mydb'))
     let azStore
     if (opts['storeConnectionStr'] && opts['storeContainer']) {
         azStore = new WriteAppendBlobs(db, opts['storeConnectionStr'], opts['storeContainer'])
@@ -575,7 +627,7 @@ async function main() {
     //console.log("sas token" + serviceClient.generateAccountSasUrl(new Date(Date.now() + (3600 * 1000 * 24)), AccountSASPermissions.parse('rwlacup'), "s"))
 
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
-    await writePathsRestartableConcurrent(db, fileSystemClient, opts['concurrency'], opts['dir'], opts['continue'], azStore)
+    await writePathsRestartableConcurrent(db, fileSystemClient, Number(opts['concurrency']), opts['dir'] as string, opts['continue'] === 'true', azStore)
 }
 
 main()

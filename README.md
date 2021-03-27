@@ -17,11 +17,11 @@ NOTE: Recomendations for large Datalakes (>10million objects):
 
 ## Usage
 
-NOTE: ensure you install dependencies & complile typescript  before running
+First, install dependencies & complile typescript:
 
         ```
         npm i
-        npx tsc
+        npm run-script build
         ```
 
 ```
