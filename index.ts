@@ -293,12 +293,11 @@ class WriteAppendBlobs {
                 this.cachedContent[blob].createValueStream({ lt: cacheSeq })
                     .on('data', d => buff.push(d))
                     .on('end', () => {
-                        console.log('finished "acls.csv"')
                         res(buff)
                     })
             })
 
-            const flushstr = writestrarr.join()
+            const flushstr = writestrarr.join('')
             this.cachedClients[blob].appendBlock(flushstr, flushstr.length)
             cacheSeq = 0; cacheSize = 0
         }
