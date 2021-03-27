@@ -244,6 +244,7 @@ import { JobManager, JobStatus, JobReturn, JobData, JobTask } from './jobmanager
 
 class WriteAppendBlobs {
 
+    private _useCache: boolean
     private _db: LevelUp
     private blobs: LevelUp
     private containerClient: ContainerClient
@@ -254,6 +255,7 @@ class WriteAppendBlobs {
     private static APPEND_BLOCK_SIZE = 4000000 // 4194304
 
     constructor(db: LevelUp, connectionStr: string, container: string) {
+        this._useCache = true
         this._db = db
         this.blobs = sub(db, 'blobs', { valueEncoding: 'json' })
         const blobServiceClient = BlobServiceClient.fromConnectionString(connectionStr);
@@ -269,8 +271,8 @@ class WriteAppendBlobs {
 
         let { cacheSeq, cacheSize, blobNumber, blockNumber/*, blockSize*/, path } = await this.blobs.get(blob)
 
-        if (cacheSize + length > WriteAppendBlobs.APPEND_BLOCK_SIZE || length === 0) {
-            // flush cache to block
+        // write to azure block, if using cache and cachesize > APPEND_BLOCK_SIZE, or flushing cache (length ===0), or no cache
+        if (cacheSize + length > WriteAppendBlobs.APPEND_BLOCK_SIZE || length === 0 || !this._useCache) {
 
             // Each blockNumber in an append blob can be a different size, up to a maximum of 4 MB, and an append blob can include up to 50,000 blocks. 
             if (blockNumber > 49990 /*|| blockSize + length > 150000000000*/) {
@@ -288,22 +290,24 @@ class WriteAppendBlobs {
             }
 
             // got blob client to write to
-            const writestrarr: string[] = await new Promise((res, rej) => {
-                const buff: string[] = []
-                this.cachedContent[blob].createValueStream({ lt: cacheSeq })
-                    .on('data', d => buff.push(d))
-                    .on('end', () => {
-                        res(buff)
-                    })
-            })
+            const writestr: string | undefined = this._useCache ?
+                await new Promise((res, rej) => {
+                    const buff: string[] = []
+                    this.cachedContent[blob].createValueStream({ lt: cacheSeq })
+                        .on('data', d => buff.push(d))
+                        .on('end', () => {
+                            res(buff.join(''))
+                        })
+                }) : body
 
-            const flushstr = writestrarr.join('')
-            this.cachedClients[blob].appendBlock(flushstr, flushstr.length)
-            cacheSeq = 0; cacheSize = 0
+            if (writestr) {
+                this.cachedClients[blob].appendBlock(writestr, writestr.length)
+                cacheSeq = 0; cacheSize = 0
+            }
         }
 
         // add body to cache
-        if (length > 0) {
+        if (this._useCache && length > 0) {
             await this.cachedContent[blob].put(cacheSeq++, body)
             cacheSize = cacheSize + length
         }
@@ -312,18 +316,22 @@ class WriteAppendBlobs {
         release()
     }
 
-    async init(blobs: string[], continueRun: boolean) {
+    async init(blobs: string[], useCache: boolean, continueRun: boolean) {
+        this._useCache = useCache
+
         for (const b of blobs) {
             this._mutexs[b] = new Atomic(1)
-            this.cachedContent[b] = sub(this._db, `cache${b}`, {
-                keyEncoding: {
-                    type: 'lexicographic-integer',
-                    encode: (n) => lexint.pack(n, 'hex'),
-                    decode: lexint.unpack,
-                    buffer: false
-                },
-                valueEncoding: 'utf8'
-            })
+            if (this._useCache) {
+                this.cachedContent[b] = sub(this._db, `cache${b}`, {
+                    keyEncoding: {
+                        type: 'lexicographic-integer',
+                        encode: (n) => lexint.pack(n, 'hex'),
+                        decode: lexint.unpack,
+                        buffer: false
+                    },
+                    valueEncoding: 'utf8'
+                })
+            }
         }
 
         if (!continueRun) {
@@ -343,7 +351,7 @@ const ERR_HEADER = 'TaskSequence,TaskType,Path,Error' + "\n"
 async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean, azBlob?: WriteAppendBlobs) {
 
     if (azBlob) {
-        await azBlob.init(['paths', 'acls', 'errors'], continueRun)
+        await azBlob.init(['paths', 'acls', 'errors'], true, continueRun)
     }
 
     if (!continueRun) {
