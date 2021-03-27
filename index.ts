@@ -251,7 +251,7 @@ class WriteAppendBlobs {
     private cachedContent: { [key: string]: LevelUp } = {}
     private _mutexs: { [key: string]: Atomic } = {}
 
-    private static APPEND_BLOCK_SIZE = 4194304
+    private static APPEND_BLOCK_SIZE = 4000000 // 4194304
 
     constructor(db: LevelUp, connectionStr: string, container: string) {
         this._db = db

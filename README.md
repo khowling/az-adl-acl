@@ -15,13 +15,25 @@ NOTE: Recomendations for large Datalakes (>10million objects):
 
  * Nodejs V14 (LTS) or above
 
+        ```
+        # Using Ubuntu
+        curl -fsSL https://deb.nodesource.com/setup_14.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+        ```
+
+ * Clone repo
+
+        ```
+        git clone https://github.com/khowling/az-adl-acl.git
+        cd az-adl-acl
+        ```
 ## Usage
 
 First, install dependencies & complile typescript:
 
         ```
         npm i
-        npm run-script build
+        npm run build
         ```
 
 ```
