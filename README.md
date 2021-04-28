@@ -65,29 +65,29 @@ Output supported to either local files or Blob container, both in CSV format
 
         ```
         isDirectory,Name,Owner,Group,OnwerPermissions,GroupPermissions,ExecutePermissions
-        true,"dir1",$superuser,$superuser,RRR,R-R,---
-        true,"tendirtop8",$superuser,$superuser,RRR,R-R,---
-        true,"tendirtop9",$superuser,$superuser,RRR,R-R,---
-        false,"dir1/newfile1615214993252",$superuser,$superuser,RR-,R--,---
-        false,"dir1/newfile1615215601371",$superuser,$superuser,RR-,R--,---
-        false,"dir1/newfile1615216127229",$superuser,$superuser,RR-,R--,---
-        true,"fivedirtop1/fivedirmiddle0",$superuser,$superuser,RRR,R-R,---
-        true,"fivedirtop1/fivedirmiddle1",$superuser,$superuser,RRR,R-R,---
+        true,"root100k/dir100k-0",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-1",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-10",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-11",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-12",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-13",$superuser,$superuser,rwx,r-x,rw-
+        true,"root100k/dir100k-14",$superuser,$superuser,rwx,r-x,rw-
         ```
 ### `acls.csv` 
 
 Contains the output of this `getAccessControl` API for each object in the datalake under the passed in directory: https://docs.microsoft.com/en-us/rest/api/storageservices/datalakestoragegen2/path/getproperties
 
         ```
-        Filepath,Type,Entity,Read,Write,Execute
-        dir1,user,,true,true,true
-        dir1,group,,true,false,true
-        dir1,other,,false,false,false
-        fivedirtop0,user,,true,true,true
-        fivedirtop0,group,,true,false,true
-        fivedirtop0,other,,false,false,false
-        fivedirtop1,user,,true,true,true
-        dir1/newfile1615214993252,user,,true,true,false
+        Filepath,DefaultScope,Type,Entity,Read,Write,Execute
+        "root100k/dir100k-0",false,user,,true,true,true
+        "root100k/dir100k-0",false,group,,true,false,true
+        "root100k/dir100k-0",false,other,,true,true,false
+        "root100k/dir100k-1",false,user,,true,true,true
+        "root100k/dir100k-1",false,group,,true,false,true
+        "root100k/dir100k-1",false,other,,true,true,false
+        "root100k/dir100k-10",false,user,,true,true,true
+        "root100k/dir100k-10",false,group,,true,false,true
+        "root100k/dir100k-10",false,other,,true,true,false
         ```
   
 ### `errors.csv`
