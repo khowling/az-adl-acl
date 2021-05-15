@@ -4,11 +4,6 @@ var lexint = require('lexicographic-integer');
 import { Atomic } from './atomic'
 import {
     DataLakeServiceClient,
-    AccountSASPermissions,
-    StorageRetryOptions,
-    StorageRetryPolicyType,
-    Pipeline,
-    ListPathsOptions,
     DataLakeFileSystemClient,
     StoragePipelineOptions,
     StorageSharedKeyCredential,
@@ -23,225 +18,13 @@ import {
 
 import { setLogLevel } from '@azure/logger'
 
-/*
-async function createFiles(fileSystemClient, seed, num) {
-    let i = 0
-    for (let topdir of [...Array(num).keys()].map(n => `${seed}dirtop${n}`)) {
-
-        for (let middle of [...Array(num).keys()].map(n => `${seed}dirmiddle${n}`)) {
-
-            for (let file of [...Array(num).keys()].map(n => `${seed}file${n}`)) {
-                process.stdout.cursorTo(0)
-                process.stdout.write(`Creating files... ${i++}`)
-                await fileSystemClient.getFileClient(`${topdir}/${middle}/${file}`).create()
-
-                // Create a file
-                //await fileClient.append('content', 0, content.length);
-                //const flushFileResponse = await fileClient.flush(content.length);
-                //console.log(`Upload file ${fileName} successfully`, flushFileResponse.requestId);
-            }
-        }
-    }
-    console.log('\ndone')
-}
-
-async function writePaths(fileSystemClient: DataLakeFileSystemClient) {
-
-    await writePathHeader()
-    let iter = await fileSystemClient.listPaths({ path: "/", recursive: true });
-
-    let file = 0, dir = 0
-    for await (const path of iter) {
-        if (path.isDirectory) dir++; else file++;
-        process.stdout.cursorTo(0)
-        process.stdout.write(`paths... file=${file} dir=${dir} `)
-        await writePathline(path)
-
-    }
-    console.log('done')
-}
-
-
-
-// RECURSION MEMORY ISSUES At LARGE SCALE !!
-// FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory
-async function writePathsRecurcive(fileSystemClient: DataLakeFileSystemClient) {
-
-    await writePathHeader()
-    let topdirs = 0, topfiles = 0
-    const mutex = new Atomic(50)
-
-    async function mylistPaths(fileSystemClient, path, release): Promise<{ childPaths: Array<string>, dirs: number, files: number }> {
-        //console.log(`listPaths level=${level} path=${path}`)
-        const childPaths: Array<string> = []
-        const paths = await fileSystemClient.listPaths({ path: path, recursive: false } as ListPathsOptions)
-
-        let dirs = 0, files = 0
-
-        for await (const path of paths) {
-            if (path.isDirectory) {
-                dirs++
-                childPaths.push(path.name)
-            } else {
-                files++
-            }
-            await writePathline(path)
-        }
-        release()
-        return { childPaths, dirs, files }
-    }
-
-    async function processesChildren({ childPaths, dirs, files }) {
-        topdirs = topdirs + dirs; topfiles = topfiles + files
-        process.stdout.cursorTo(0)
-        process.stdout.write(`top paths... file=${topfiles} dir=${topdirs} `)
-        //console.log(`processesChildren level=${level} dirs=${childPaths.length}`)
-        for (const path of childPaths) {
-            let release = await mutex.aquire()
-            mylistPaths(fileSystemClient, path, release).then(processesChildren)
-        }
-    }
-
-    await processesChildren({ childPaths: ["/"], dirs: 0, files: 0 })
-    console.log('done')
-
-}
-
-
-
-async function getALCs(fileSystemClient: DataLakeFileSystemClient, release, fileinfo: string) {
-
-    const [isDirectory, path] = fileinfo.split(',')
-    //console.log(`getALCs: path=${path}, isDirectory=${isDirectory}`)
-    if (isDirectory === 'true') {
-        const dpermissions = await fileSystemClient.getDirectoryClient(path).getAccessControl();
-        dpermissions.acl.forEach(async p => {
-            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
-        })
-    } else {
-        const fpermissions = await fileSystemClient.getFileClient(path).getAccessControl();
-        fpermissions.acl.forEach(async p => {
-            await fs.promises.appendFile('./acls.csv', `${path},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}` + "\n")
-        })
-
-    }
-    release()
-
-}
-
-
-
-const { Transform } = require('stream');
-class PathsCSV extends Transform {
-    private _donehead = false
-
-    _transform(chunk, encoding, cb) {
-        try {
-            if (!this._donehead) {
-                this.push('isDirectory,Filepath,Path,Name,Owner,Group' + "\n")
-                this._donehead = true
-            }
-            const path = pathType.fromBuffer(chunk)
-
-            const lastidx = path.name.lastIndexOf('/')
-            this.push(`${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}` + "\n")
-
-            cb()
-        } catch (e) {
-            cb(new Error(`chunk ${chunk} is not a json: ${e}`));
-        }
-    }
-}
-
-class ACLsCSV extends Transform {
-    private _donehead = false
-
-    _transform(chunk, encoding, cb) {
-        try {
-            if (!this._donehead) {
-                this.push('Filepath,Type,Entity,Read,Write,Execute' + "\n")
-                this._donehead = true
-            }
-            const { path, acls } = aclType2.fromBuffer(chunk)
-            for (let a of acls) {
-                this.push(`${path},${a.accessControlType},${a.entityId},${a.permissions.read},${a.permissions.write},${a.permissions.execute}` + "\n")
-            }
-
-            cb()
-        } catch (e) {
-            cb(new Error(`chunk ${chunk} is not a json: ${e}`));
-        }
-    }
-}
-
-
-
-const avro = require('avsc');
-
-const pathType = avro.Type.forValue({
-    name: "dir1",
-    isDirectory: true,
-    lastModified: new Date(),
-    owner: "$superuser",
-    group: "$superuser",
-    permissions: {
-        owner: {
-            read: true,
-            write: true,
-            execute: true
-        },
-        group: {
-            read: true,
-            write: false,
-            execute: true
-        },
-        other: {
-            read: false,
-            write: false,
-            execute: false
-        },
-        stickyBit: false,
-        extendedAcls: false
-    },
-    creationTime: "132596885753691420",
-    etag: "0x8D8E2416422FEF2"
-})
-
-const aclType2 = avro.Type.forValue({
-    path: "dir1",
-    acls: [
-        {
-            "defaultScope": false,
-            "accessControlType": "user",
-            "entityId": "",
-            "permissions": {
-                "read": true,
-                "write": true,
-                "execute": false
-            }
-        },
-        {
-            "defaultScope": false,
-            "accessControlType": "user",
-            "entityId": "",
-            "permissions": {
-                "read": true,
-                "write": true,
-                "execute": false
-            }
-        }
-    ]
-})
-
-*/
-
 import level, { LevelUp } from 'levelup'
 var leveldown = require('leveldown')
 import sub from 'subleveldown'
 
 import { JobManager, JobStatus, JobReturn, JobData, JobTask } from './jobmanager'
 
-
+// Manage writing output to Azure Blob
 class WriteAppendBlobs {
 
     private _useCache: boolean
@@ -343,11 +126,12 @@ class WriteAppendBlobs {
     }
 }
 
-//const PATH_HEADER = 'isDirectory,Filepath,Path,Name,Owner,Group' + "\n"
+
 const PATH_HEADER = 'isDirectory,Name,Owner,Group,OnwerPermissions,GroupPermissions,ExecutePermissions' + "\n"
 const ACL_HEADER = 'Filepath,DefaultScope,Type,Entity,Read,Write,Execute' + "\n"
 const ERR_HEADER = 'TaskSequence,TaskType,Path,Error' + "\n"
 
+// Main Logic to call and process results from the DataLake API
 async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: DataLakeFileSystemClient, concurrency: number, startDir: string, continueRun: boolean, azBlob?: WriteAppendBlobs) {
 
     if (azBlob) {
@@ -386,15 +170,11 @@ async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: Da
                             } else {
                                 metrics.files++
                             }
-                            //await pathsdb.put(path.name, pathType.toBuffer(path))                        
                         }
 
-                        // 
                         if (batchCompleteIdx >= d.completedBatches) {
 
                             const body = response.pathItems.map(path => {
-                                //const lastidx = path.name.lastIndexOf('/')
-                                //return `${path.isDirectory},${path.name},${lastidx > 0 ? path.name.substr(0, lastidx) : ''},${lastidx > 0 ? path.name.substr(lastidx + 1) : path.name},${path.owner},${path.group}`
                                 const { owner, group, other } = path.permissions as PathPermissions
                                 return `${path.isDirectory},"${path.name}",${path.owner},${path.group},${owner.read ? 'r' : '-'}${owner.write ? 'w' : '-'}${owner.execute ? 'x' : '-'},${group.read ? 'r' : '-'}${group.write ? 'w' : '-'}${group.execute ? 'x' : '-'},${other.read ? 'r' : '-'}${other.write ? 'w' : '-'}${other.execute ? 'x' : '-'}`
                             }).join("\n") + "\n"
@@ -406,7 +186,7 @@ async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: Da
                             }
 
                             await paths_q.runningCompleteBatch({ seq, updateJobData: { ...d, completedBatches: batchCompleteIdx + 1 } as JobData, status, metrics, newJobs })
-                            //}
+
                         }
                         metrics = { dirs: 0, files: 0, acls: 0, errors: 0 }
                         batchCompleteIdx++
@@ -417,7 +197,7 @@ async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: Da
 
             } else if (d.task === JobTask.GetACLs) {
 
-                const permissions = d.isDirectory ? await fileSystemClient.getDirectoryClient(d.path).getAccessControl() : await fileSystemClient.getFileClient(d.path).getAccessControl()
+                const permissions = d.isDirectory ? await fileSystemClient.getDirectoryClient(d.path).getAccessControl(/*{ userPrincipalName: true }*/) : await fileSystemClient.getFileClient(d.path).getAccessControl(/*{ userPrincipalName: true }*/)
                 metrics.acls = permissions.acl.length
 
                 const body = permissions.acl.map(p => `"${d.path}",${p.defaultScope},${p.accessControlType},${p.entityId},${p.permissions.read},${p.permissions.write},${p.permissions.execute}`).join("\n") + "\n"
@@ -461,63 +241,6 @@ async function writePathsRestartableConcurrent(db: LevelUp, fileSystemClient: Da
         await azBlob.write('errors')
     }
 
-    /*
-        const aclsdb = sub(db, 'acls', { valueEncoding: 'binary' })
-        const acls_q = new JobManager("acls", db, 50, async function (seq: number, path: string): Promise<JobReturn> {
-            try {
-                const val = await pathsdb.get(path)
-                const p = pathType.fromBuffer(val)
-    
-                let dirs = p.isDirectory ? 1 : 0, files = p.isDirectory ? 0 : 1
-                const permissions = p.isDirectory ? await fileSystemClient.getDirectoryClient(path).getAccessControl() : await fileSystemClient.getFileClient(path).getAccessControl()
-                //for (let a of permissions.acl) {
-                await aclsdb.put(path, aclType2.toBuffer({ path, acls: permissions.acl }))
-                //}
-    
-                return { seq, status: JobStatus.Success, metrics: { dirs, files } }
-            } catch (e) {
-                console.error(e)
-                process.exit(1)
-            }
-        })
-    
-        await acls_q.start(reset)
-        if (reset) {
-            await aclsdb.clear()
-            await new Promise((res, rej) => {
-                let cnt = 0
-                const feed = pathsdb.createKeyStream().on('data', async d => {
-                    cnt++
-                    await acls_q.submit(d)
-                })
-                feed.on('end', () => {
-                    console.log(`finish queueing ${cnt} acl jobs`)
-                    res(cnt)
-                })
-            })
-    
-        }
-    
-        await acls_q.finishedSubmitting()
-    
-        await new Promise((res, rej) => {
-            console.log('Creating "paths.csv" file...')
-            const pfile = pathsdb.createValueStream().pipe(new PathsCSV()).pipe(fs.createWriteStream('./paths.csv'))
-            pfile.on('finish', () => {
-                console.log('finished  "paths.csv"')
-                res(true)
-            })
-        })
-    
-        await new Promise((res, rej) => {
-            console.log('Creating "acls.csv" file...')
-            const afile = aclsdb.createValueStream().pipe(new ACLsCSV()).pipe(fs.createWriteStream('./acls.csv'))
-            afile.on('finish', () => {
-                console.log('finished "acls.csv"')
-                res(true)
-            })
-        })
-    */
     db.close(() => console.log('closing job manager'))
 }
 
@@ -630,9 +353,6 @@ async function main() {
     if (opts['storeConnectionStr'] && opts['storeContainer']) {
         azStore = new WriteAppendBlobs(db, opts['storeConnectionStr'], opts['storeContainer'])
     }
-
-    //console.log("sas token" + serviceClient.generateAccountSasUrl(new Date(Date.now() + (3600 * 1000 * 24)), AccountSASPermissions.parse('rwlacup'), "s"))
-
     const fileSystemClient = serviceClient.getFileSystemClient(fileSystemName)
     await writePathsRestartableConcurrent(db, fileSystemClient, Number(opts['concurrency']), opts['dir'] as string, opts['continue'] === 'true', azStore)
 }
